@@ -39,14 +39,15 @@ as $$
   );
 $$;
 
--- Answers "may I use this post?" -- true when the post exists and the signed-in
--- user is a member of its business.
+-- Answers "does this post sit in this business?" -- used to keep all three ids on a
+-- scheduled_posts row pointing at the same tenant.
 --
--- Note it returns a BOOLEAN, not the business id. An earlier version returned the
--- business_id for any post id handed to it, which let any signed-in user turn a
--- guessed post UUID into the id of the business that owns it. Returning only yes/no
--- tells the caller nothing they were not already entitled to know.
-create or replace function app.may_use_post(target_post_id uuid)
+-- Note it takes the business as an ARGUMENT and returns a boolean, rather than
+-- looking the business up and returning it. A helper that returns an id is an
+-- enumeration oracle: any signed-in user could hand it a guessed post UUID and get
+-- back the id of the business that owns it. Answering yes/no to a business the
+-- caller already named leaks nothing.
+create or replace function app.post_belongs_to(target_post_id uuid, target_business_id uuid)
 returns boolean
 language sql
 stable
@@ -54,23 +55,16 @@ security definer
 set search_path = ''
 as $$
   select exists (
-    select 1
-    from public.posts p
-    join public.business_members m on m.business_id = p.business_id
-    where p.id = target_post_id
-      and m.user_id = (select auth.uid())
+    select 1 from public.posts p
+    where p.id = target_post_id and p.business_id = target_business_id
   );
 $$;
 
--- Answers "do this post and this social account belong to the same business?"
+-- Answers "does this social account sit in this business?"
 --
--- scheduled_posts joins a post to a connected account. Without this check a member
--- of Business B could schedule their own post onto Business A's Instagram account,
--- because the post half of the row would look perfectly legitimate.
-create or replace function app.post_and_account_share_business(
-  target_post_id    uuid,
-  target_account_id uuid
-)
+-- Without this check a member of Business B could schedule their own post onto
+-- Business A's connected Instagram account.
+create or replace function app.account_belongs_to(target_account_id uuid, target_business_id uuid)
 returns boolean
 language sql
 stable
@@ -78,11 +72,8 @@ security definer
 set search_path = ''
 as $$
   select exists (
-    select 1
-    from public.posts p
-    join public.social_accounts a on a.business_id = p.business_id
-    where p.id = target_post_id
-      and a.id = target_account_id
+    select 1 from public.social_accounts a
+    where a.id = target_account_id and a.business_id = target_business_id
   );
 $$;
 
@@ -103,9 +94,9 @@ revoke all on function app.business_of_post_for_audit(uuid) from public;
 
 revoke all on function app.is_member_of(uuid) from public;
 revoke all on function app.has_role_in(uuid, public.member_role[]) from public;
-revoke all on function app.may_use_post(uuid) from public;
-revoke all on function app.post_and_account_share_business(uuid, uuid) from public;
+revoke all on function app.post_belongs_to(uuid, uuid) from public;
+revoke all on function app.account_belongs_to(uuid, uuid) from public;
 grant execute on function app.is_member_of(uuid) to authenticated;
 grant execute on function app.has_role_in(uuid, public.member_role[]) to authenticated;
-grant execute on function app.may_use_post(uuid) to authenticated;
-grant execute on function app.post_and_account_share_business(uuid, uuid) to authenticated;
+grant execute on function app.post_belongs_to(uuid, uuid) to authenticated;
+grant execute on function app.account_belongs_to(uuid, uuid) to authenticated;

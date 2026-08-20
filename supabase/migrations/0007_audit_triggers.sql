@@ -19,13 +19,14 @@ declare
 begin
   row_snapshot := to_jsonb(coalesce(new, old));
 
-  -- Most tables carry business_id. scheduled_posts has to ask its parent post.
+  -- Every audited table carries business_id except businesses itself, which IS
+  -- the business. Reading it straight off the row matters for cascade deletes:
+  -- looking it up through a parent would fail, because by the time this trigger
+  -- runs the parent row is already gone.
   if row_snapshot ? 'business_id' then
     target_business := (row_snapshot ->> 'business_id')::uuid;
   elsif tg_table_name = 'businesses' then
     target_business := (row_snapshot ->> 'id')::uuid;
-  elsif row_snapshot ? 'post_id' then
-    target_business := app.business_of_post_for_audit((row_snapshot ->> 'post_id')::uuid);
   end if;
 
   if tg_op = 'UPDATE' then

@@ -1,9 +1,7 @@
 import 'server-only'
 
 import { headers } from 'next/headers'
-import type { SupabaseClient } from '@supabase/supabase-js'
 
-import { createSupabaseServerClient } from '@/lib/supabase/server'
 import { createSupabaseAdminClient } from '@/lib/supabase/admin'
 
 export type AuditEntry = {
@@ -12,6 +10,8 @@ export type AuditEntry = {
   targetType?: string | null
   targetId?: string | null
   metadata?: Record<string, unknown>
+  /** The user this action belongs to. Established by requireMfaSession(), never by the browser. */
+  actorUserId?: string | null
 }
 
 /**
@@ -33,47 +33,50 @@ export async function clientIp(): Promise<string | null> {
   return /^[0-9a-fA-F:.]+$/.test(withoutPort) ? withoutPort : null
 }
 
-async function write(supabase: SupabaseClient, entry: AuditEntry, ip: string | null): Promise<void> {
-  // app.write_audit stamps the actor from the JWT itself, so a caller can never
-  // forge whose action this was.
-  const { error } = await supabase.schema('app').rpc('write_audit', {
-    p_action: entry.action,
-    p_business_id: entry.businessId ?? null,
-    p_target_type: entry.targetType ?? null,
-    p_target_id: entry.targetId ?? null,
-    p_metadata: entry.metadata ?? {},
-    p_ip: ip,
-  })
-
-  if (error) {
-    // A lost audit row must never take a user-facing request down with it, but it
-    // does need to be loud in the server logs.
-    console.error('[audit] failed to record %s: %s', entry.action, error.message)
-  }
-}
-
 /**
- * Records an action taken by the signed-in user. Pass the client you already have
- * when the session was created moments ago, so the audit row is written under it.
+ * Appends one audit_log row.
+ *
+ * This always goes through the service-role client, on our own server, and never
+ * through the user's session. That is deliberate:
+ *
+ *   - app.write_audit is SECURITY DEFINER, so it writes past row level security.
+ *     If it were callable by `authenticated`, any signed-in user could write
+ *     permanent, undeletable rows into any tenant's audit trail with a forged
+ *     action and a forged IP. It is granted to service_role only.
+ *   - Only our server knows the true client IP, from the proxy headers. A value
+ *     supplied by the browser would be worthless in an audit log.
+ *   - The actor comes from the session we already verified with requireMfaSession(),
+ *     not from the request body. And the database independently prefers auth.uid()
+ *     over the actor we pass, so impersonation is impossible even from here.
  */
-export async function recordAudit(entry: AuditEntry, client?: SupabaseClient): Promise<void> {
-  try {
-    const supabase = client ?? (await createSupabaseServerClient())
-    await write(supabase, entry, await clientIp())
-  } catch (error) {
-    console.error('[audit] failed to record %s: %o', entry.action, error)
-  }
-}
-
-/**
- * Records an action where there is no session to record it under — in practice
- * only a failed login. Uses the service role client, so the actor comes out null.
- */
-export async function recordAnonymousAudit(entry: AuditEntry): Promise<void> {
+export async function recordAudit(entry: AuditEntry): Promise<void> {
   try {
     const supabase = createSupabaseAdminClient()
-    await write(supabase, entry, await clientIp())
+    const { error } = await supabase.schema('app').rpc('write_audit', {
+      p_action: entry.action,
+      p_business_id: entry.businessId ?? null,
+      p_target_type: entry.targetType ?? null,
+      p_target_id: entry.targetId ?? null,
+      p_metadata: entry.metadata ?? {},
+      p_ip: await clientIp(),
+      p_actor_user_id: entry.actorUserId ?? null,
+    })
+
+    if (error) {
+      // A lost audit row must never take a user-facing request down with it, but
+      // it does need to be loud in the server logs.
+      console.error('[audit] failed to record %s: %s', entry.action, error.message)
+    }
   } catch (error) {
     console.error('[audit] failed to record %s: %o', entry.action, error)
   }
+}
+
+/**
+ * Records an action where there is no session at all — in practice only a failed
+ * login. The actor is whatever user id we could resolve for the attempted email,
+ * or null if the account does not exist.
+ */
+export async function recordAnonymousAudit(entry: AuditEntry): Promise<void> {
+  await recordAudit(entry)
 }

@@ -73,3 +73,21 @@ create or replace view vault.decrypted_secrets as
 
 -- Mirrors Supabase: the Vault is not reachable from client roles.
 revoke all on schema vault from anon, authenticated;
+
+-- ===========================================================================
+-- The single most important line in this file.
+--
+-- A real Supabase project runs this at bootstrap, which means EVERY table a
+-- migration creates in `public` is automatically granted ALL privileges -- select,
+-- insert, update, delete and TRUNCATE -- to the signed-out `anon` role. A test
+-- database without it is far friendlier than production, and would happily certify
+-- an app that a signed-out visitor could truncate.
+--
+-- Reproducing it here is what makes the "anon can touch nothing" tests meaningful:
+-- they now pass only because 0006_rls_policies.sql explicitly revokes first.
+-- ===========================================================================
+alter default privileges in schema public
+  grant all on tables to anon, authenticated, service_role;
+alter default privileges in schema public
+  grant all on sequences to anon, authenticated, service_role;
+grant usage on schema public to anon, authenticated, service_role;

@@ -12,7 +12,7 @@ const SIX_DIGITS = /^\d{6}$/
 export async function confirmEnrollmentAction(formData: FormData): Promise<void> {
   await assertCsrf(formData)
   // The proxy cannot cover this POST reliably, so the session is re-established here.
-  const { supabase } = await requireSignedInUserOrThrow()
+  const { supabase, user } = await requireSignedInUserOrThrow()
 
   const factorId = String(formData.get('factorId') ?? '')
   const code = String(formData.get('code') ?? '').trim()
@@ -39,6 +39,7 @@ export async function confirmEnrollmentAction(formData: FormData): Promise<void>
       targetType: 'mfa_factor',
       targetId: factorId,
       metadata: { reason: verifyError.message },
+      actorUserId: user.id,
     })
     redirect(`${MFA_ENROLL_PATH}?error=invalid_code`)
   }
@@ -47,6 +48,7 @@ export async function confirmEnrollmentAction(formData: FormData): Promise<void>
     action: 'auth.mfa.enroll',
     targetType: 'mfa_factor',
     targetId: factorId,
+    actorUserId: user.id,
   })
 
   redirect(DASHBOARD_PATH)

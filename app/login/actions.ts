@@ -24,7 +24,10 @@ export async function signInAction(formData: FormData): Promise<void> {
   const { error } = await supabase.auth.signInWithPassword({ email, password })
 
   if (error) {
-    // Written with the service role client because there is no session to write under.
+    // No session exists, so this row has a null actor. The attempted address is
+    // kept deliberately: without it a burst of failures cannot be told apart from
+    // credential stuffing. It is the one piece of personal data in an append-only
+    // table, and is noted as such in BUILD_NOTES.md.
     await recordAnonymousAudit({
       action: 'auth.login.failure',
       metadata: { email, reason: error.message },
@@ -33,7 +36,9 @@ export async function signInAction(formData: FormData): Promise<void> {
     redirect(`${LOGIN_PATH}?error=invalid`)
   }
 
-  await recordAudit({ action: 'auth.login.success' }, supabase)
+  // The user id comes from the session we just established, not from the form.
+  const { data: signedIn } = await supabase.auth.getUser()
+  await recordAudit({ action: 'auth.login.success', actorUserId: signedIn.user?.id ?? null })
 
   // A password is only the first factor; where to go next depends on MFA state.
   const { data: aal } = await supabase.auth.mfa.getAuthenticatorAssuranceLevel()

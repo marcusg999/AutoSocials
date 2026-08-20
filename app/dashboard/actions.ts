@@ -12,7 +12,7 @@ import { DASHBOARD_PATH } from '@/lib/security/routes'
 export async function switchBusinessAction(formData: FormData): Promise<void> {
   await assertCsrf(formData)
   // Layer 2: this POST is routed to the page, not through a proxy-matched route of its own.
-  const { supabase } = await requireMfaSessionOrThrow()
+  const { supabase, userId } = await requireMfaSessionOrThrow()
 
   const businessId = String(formData.get('businessId') ?? '')
   if (!UUID_PATTERN.test(businessId)) throw new Error('Invalid business id')
@@ -35,6 +35,7 @@ export async function switchBusinessAction(formData: FormData): Promise<void> {
     businessId,
     targetType: 'business',
     targetId: businessId,
+    actorUserId: userId,
   })
 
   revalidatePath(DASHBOARD_PATH)

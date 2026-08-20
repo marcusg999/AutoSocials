@@ -48,15 +48,24 @@ create trigger audit_log_no_delete
   for each row execute function app.audit_log_is_append_only();
 
 -- The one supported way to write an audit row.
+--
 -- SECURITY DEFINER so it can insert past RLS, but it stamps the actor from the
 -- live JWT rather than trusting a caller-supplied user id.
+--
+-- This function is granted to service_role ONLY. It performs no membership or MFA
+-- check of its own, precisely because trusted server-side callers need to log
+-- events (a failed login) where there is no session to check. Signed-in users
+-- reach it through public.record_audit_event(), which does check. Granting this
+-- directly to `authenticated` would hand every user an RLS-bypassing write into
+-- any tenant's permanent, undeletable audit trail.
 create or replace function app.write_audit(
   p_action      text,
   p_business_id uuid    default null,
   p_target_type text    default null,
   p_target_id   text    default null,
   p_metadata    jsonb   default '{}'::jsonb,
-  p_ip          inet    default null
+  p_ip          inet    default null,
+  p_actor_user_id uuid  default null
 )
 returns bigint
 language plpgsql
@@ -65,11 +74,18 @@ set search_path = ''
 as $$
 declare
   new_id bigint;
+  actor  uuid;
 begin
+  -- The JWT always wins. p_actor_user_id is only consulted when there is no
+  -- session at all -- which happens exactly once, when our own server records a
+  -- FAILED login on behalf of someone who never got a session. Because the JWT
+  -- takes precedence, no session can ever use this parameter to impersonate.
+  actor := coalesce((select auth.uid()), p_actor_user_id);
+
   insert into public.audit_log
     (actor_user_id, business_id, action, target_type, target_id, metadata, ip)
   values
-    ((select auth.uid()), p_business_id, p_action, p_target_type, p_target_id,
+    (actor, p_business_id, p_action, p_target_type, p_target_id,
      coalesce(p_metadata, '{}'::jsonb), p_ip)
   returning id into new_id;
   return new_id;
@@ -79,5 +95,7 @@ $$;
 comment on function app.write_audit is
   'Appends one audit_log row, stamping the actor from the current JWT.';
 
-revoke all on function app.write_audit(text, uuid, text, text, jsonb, inet) from public;
-grant execute on function app.write_audit(text, uuid, text, text, jsonb, inet) to authenticated;
+revoke all on function app.write_audit(text, uuid, text, text, jsonb, inet, uuid) from public;
+grant execute on function app.write_audit(text, uuid, text, text, jsonb, inet, uuid) to service_role;
+
+revoke all on function app.audit_log_is_append_only() from public;

@@ -11,7 +11,7 @@ const SIX_DIGITS = /^\d{6}$/
 
 export async function verifyFactorAction(formData: FormData): Promise<void> {
   await assertCsrf(formData)
-  const { supabase } = await requireSignedInUserOrThrow()
+  const { supabase, user } = await requireSignedInUserOrThrow()
 
   const factorId = String(formData.get('factorId') ?? '')
   const code = String(formData.get('code') ?? '').trim()
@@ -40,6 +40,7 @@ export async function verifyFactorAction(formData: FormData): Promise<void> {
       targetType: 'mfa_factor',
       targetId: factorId,
       metadata: { reason: verifyError.message },
+      actorUserId: user.id,
     })
     redirect(`${MFA_VERIFY_PATH}?error=invalid_code`)
   }
@@ -48,6 +49,7 @@ export async function verifyFactorAction(formData: FormData): Promise<void> {
     action: 'auth.mfa.verify',
     targetType: 'mfa_factor',
     targetId: factorId,
+    actorUserId: user.id,
   })
 
   redirect(DASHBOARD_PATH)

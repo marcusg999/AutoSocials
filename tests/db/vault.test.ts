@@ -47,7 +47,7 @@ test('the secret is not stored in plaintext anywhere in the vault table', async 
 
 test('a trusted server-side caller can read the credential back', async () => {
   await asAdmin(url, async (q) => {
-    const r = await q(`select app.read_account_credential($1) as v`, ['social_account_' + accountId.replace(/-/g, '')])
+    const r = await q(`select app.read_account_credential($1) as v`, [accountId])
     expect(r.rows[0].v).toBe(SECRET)
   })
 })
@@ -55,7 +55,7 @@ test('a trusted server-side caller can read the credential back', async () => {
 describe('a signed-in browser session cannot reach the Vault', () => {
   test('a member of the business still cannot execute read_account_credential', async () => {
     await asUser(url, ALICE, 'aal2', async (q) => {
-      const err = await expectRejected(() => q(`select app.read_account_credential('social_account_x')`))
+      const err = await expectRejected(() => q(`select app.read_account_credential($1)`, [accountId]))
       expect(err.message).toMatch(/permission denied/i)
     })
   })

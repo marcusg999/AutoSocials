@@ -15,11 +15,10 @@ import { LOGIN_PATH } from '@/lib/security/routes'
  */
 export async function signOutAction(formData: FormData): Promise<void> {
   await assertCsrf(formData)
-  const { supabase } = await requireSignedInUserOrThrow()
+  const { supabase, user } = await requireSignedInUserOrThrow()
 
-  // Recorded before the session is destroyed, because app.write_audit stamps the
-  // actor from the JWT and there will not be one a moment from now.
-  await recordAudit({ action: 'auth.signout' })
+  // Recorded before the session is destroyed, using the user id we just verified.
+  await recordAudit({ action: 'auth.signout', actorUserId: user.id })
 
   await supabase.auth.signOut()
 

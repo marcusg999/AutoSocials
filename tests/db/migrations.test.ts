@@ -80,3 +80,35 @@ test('the seed creates exactly the seven named businesses, and re-seeding does n
     'BUSINESS_1', 'BUSINESS_2', 'BUSINESS_3', 'BUSINESS_4', 'BUSINESS_5', 'BUSINESS_6', 'BUSINESS_7',
   ])
 })
+
+test('the seed rollback never destroys a business that is actually in use', async () => {
+  // 0009's rollback deletes seeded businesses by name, and `businesses` cascades to
+  // members, posts and connected accounts. Run carelessly against a live database
+  // that would silently wipe real customer data, so it skips anything in use.
+  const url = urlFor(DB)
+  await runMigrations(url, 'up')
+
+  const c = new Client({ connectionString: url })
+  await c.connect()
+  try {
+    const userId = '55555555-5555-5555-5555-555555555555'
+    await c.query(`insert into auth.users (id, email) values ($1,'in-use@example.com') on conflict do nothing`, [userId])
+    const inUse = (await c.query(`select id from public.businesses where name = 'BUSINESS_1'`)).rows[0].id
+    await c.query(`insert into public.business_members (business_id, user_id, role) values ($1,$2,'owner')`, [inUse, userId])
+    await c.query(`insert into public.posts (business_id, created_by, body) values ($1,$2,'{"real":"work"}')`, [inUse, userId])
+
+    // Apply just the seed rollback.
+    await c.query(readFileSync(join(process.cwd(), 'supabase/migrations/0009_seed_businesses.down.sql'), 'utf8'))
+
+    const survived = await c.query(`select count(*)::int n from public.businesses where id = $1`, [inUse])
+    expect(survived.rows[0].n, 'a business with real data must not be deleted by a rollback').toBe(1)
+    const postsKept = await c.query(`select count(*)::int n from public.posts where business_id = $1`, [inUse])
+    expect(postsKept.rows[0].n, 'its posts must not be cascade-deleted').toBe(1)
+
+    // The six untouched seed businesses are fair game and should be gone.
+    const remaining = await c.query(`select count(*)::int n from public.businesses where name like 'BUSINESS_%'`)
+    expect(remaining.rows[0].n).toBe(1)
+  } finally {
+    await c.end()
+  }
+}, 120_000)

@@ -38,7 +38,7 @@ beforeAll(async () => {
     postA = p.rows[0].id
     const acc = await q(`insert into public.social_accounts (business_id, platform, label) values ($1,'instagram','A insta') returning id`, [businessA])
     accountA = acc.rows[0].id
-    const s = await q(`insert into public.scheduled_posts (post_id, social_account_id, scheduled_for) values ($1,$2, now() + interval '1 day') returning id`, [postA, accountA])
+    const s = await q(`insert into public.scheduled_posts (post_id, social_account_id, business_id, scheduled_for) values ($1,$2,$3, now() + interval '1 day') returning id`, [postA, accountA, businessA])
     scheduledA = s.rows[0].id
   })
 }, 60_000)
@@ -57,7 +57,7 @@ describe('a member sees their own tenant', () => {
 
   test('Alice can write inside her own business', async () => {
     await asUser(url, ALICE, 'aal2', async (q) => {
-      const r = await q(`insert into public.posts (business_id, body) values ($1,'{"text":"mine"}') returning id`, [businessA])
+      const r = await q(`insert into public.posts (business_id, created_by, body) values ($1,$2,'{"text":"mine"}') returning id`, [businessA, ALICE])
       expect(r.rowCount).toBe(1)
     })
   })
@@ -107,7 +107,7 @@ describe('QUALITY BAR: a cross-tenant write is rejected', () => {
   test('Mallory cannot create a post inside Alice\'s business', async () => {
     await asUser(url, MALLORY, 'aal2', async (q) => {
       const err = await expectRejected(() =>
-        q(`insert into public.posts (business_id, body) values ($1,'{"text":"intrusion"}')`, [businessA]))
+        q(`insert into public.posts (business_id, created_by, body) values ($1,$2,'{"text":"intrusion"}')`, [businessA, MALLORY]))
       expect(err.message).toMatch(/row-level security/i)
     })
   })
@@ -142,7 +142,7 @@ describe('QUALITY BAR: a cross-tenant write is rejected', () => {
   test('Mallory cannot move her own post into Alice\'s business', async () => {
     let mallorysPost: string
     await asUser(url, MALLORY, 'aal2', async (q) => {
-      const r = await q(`insert into public.posts (business_id, body) values ($1,'{}') returning id`, [businessB])
+      const r = await q(`insert into public.posts (business_id, created_by, body) values ($1,$2,'{}') returning id`, [businessB, MALLORY])
       mallorysPost = r.rows[0].id
       const err = await expectRejected(() =>
         q(`update public.posts set business_id=$1 where id=$2`, [businessA, mallorysPost]))
@@ -154,10 +154,10 @@ describe('QUALITY BAR: a cross-tenant write is rejected', () => {
     // The subtle one: both halves of scheduled_posts must belong to the same tenant,
     // or you could publish to someone else's Instagram from your own post.
     await asUser(url, MALLORY, 'aal2', async (q) => {
-      const p = await q(`insert into public.posts (business_id, body) values ($1,'{}') returning id`, [businessB])
+      const p = await q(`insert into public.posts (business_id, created_by, body) values ($1,$2,'{}') returning id`, [businessB, MALLORY])
       const err = await expectRejected(() =>
-        q(`insert into public.scheduled_posts (post_id, social_account_id, scheduled_for) values ($1,$2, now())`,
-          [p.rows[0].id, accountA]))
+        q(`insert into public.scheduled_posts (post_id, social_account_id, business_id, scheduled_for) values ($1,$2,$3, now())`,
+          [p.rows[0].id, accountA, businessB]))
       expect(err.message).toMatch(/row-level security/i)
     })
   })
@@ -182,7 +182,8 @@ describe('the RLS helper functions do not leak tenant information', () => {
 
   test('the helpers Mallory CAN call answer only yes/no, and answer "no"', async () => {
     await asUser(url, MALLORY, 'aal2', async (q) => {
-      expect((await q(`select app.may_use_post($1) as v`, [postA])).rows[0].v).toBe(false)
+      expect((await q(`select app.post_belongs_to($1,$2) as v`, [postA, businessB])).rows[0].v).toBe(false)
+      expect((await q(`select app.account_belongs_to($1,$2) as v`, [accountA, businessB])).rows[0].v).toBe(false)
       expect((await q(`select app.is_member_of($1) as v`, [businessA])).rows[0].v).toBe(false)
     })
   })

@@ -26,7 +26,9 @@ function loadMigrations(): Migration[] {
     if (!files.includes(downFile)) {
       throw new Error(`${upFile} has no matching ${downFile} — every migration must be reversible`)
     }
-    return { version: name.split('_')[0], name, upFile, downFile }
+    // Keyed on the whole filename, not just the numeric prefix: two migrations
+    // sharing a prefix would otherwise silently collide in the ledger.
+    return { version: name, name, upFile, downFile }
   })
 }
 
@@ -103,7 +105,12 @@ export async function runMigrations(connectionString: string, direction: 'up' | 
   }
 }
 
-if (process.argv[1] && import.meta.url.endsWith(process.argv[1].split('/').pop()!)) {
+// Run the CLI only when this file is the entry point, not when a test imports it.
+const invokedDirectly =
+  process.argv[1] !== undefined &&
+  import.meta.url === new URL(`file://${process.argv[1]}`).href
+
+if (invokedDirectly) {
   const direction = (process.argv[2] ?? 'up') as 'up' | 'down' | 'reset'
   const url = process.env.DATABASE_URL
   if (!url) {

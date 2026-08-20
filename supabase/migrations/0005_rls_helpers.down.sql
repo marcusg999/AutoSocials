@@ -1,4 +1,6 @@
 -- Reverses 0005_rls_helpers.sql
+drop function if exists app.account_belongs_to(uuid, uuid);
+drop function if exists app.post_belongs_to(uuid, uuid);
 drop function if exists app.post_and_account_share_business(uuid, uuid);
 drop function if exists app.may_use_post(uuid);
 drop function if exists app.business_of_post_for_audit(uuid);

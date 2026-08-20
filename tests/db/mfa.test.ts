@@ -22,7 +22,7 @@ beforeAll(async () => {
     const a = await q(`insert into public.businesses (name) values ('Tenant A') returning id`)
     businessA = a.rows[0].id
     await q(`insert into public.business_members (business_id, user_id, role) values ($1,$2,'owner')`, [businessA, ALICE])
-    await q(`insert into public.posts (business_id, body) values ($1,'{"text":"members only"}')`, [businessA])
+    await q(`insert into public.posts (business_id, created_by, body) values ($1,$2,'{"text":"members only"}')`, [businessA, ALICE])
   })
 }, 60_000)
 
@@ -53,7 +53,7 @@ describe('a password-only session (aal1) is refused everywhere', () => {
   test('aal1 cannot write, even into a business the user genuinely owns', async () => {
     await asUser(url, ALICE, 'aal1', async (q) => {
       const err = await expectRejected(() =>
-        q(`insert into public.posts (business_id, body) values ($1,'{}')`, [businessA]))
+        q(`insert into public.posts (business_id, created_by, body) values ($1,$2,'{}')`, [businessA, ALICE]))
       expect(err.message).toMatch(/row-level security/i)
     })
   })

@@ -59,6 +59,12 @@ create table if not exists public.scheduled_posts (
   id                uuid primary key default gen_random_uuid(),
   post_id           uuid not null references public.posts (id) on delete cascade,
   social_account_id uuid not null references public.social_accounts (id) on delete cascade,
+  -- Denormalized from the parent post on purpose. Deleting a post cascades to this
+  -- row, and by the time the audit trigger runs the parent is already gone -- so
+  -- without a business_id of its own the audit entry for the cascade would be
+  -- filed against nobody and be invisible to every tenant. It also lets the RLS
+  -- policies read the tenant straight off the row.
+  business_id       uuid not null references public.businesses (id) on delete cascade,
   scheduled_for     timestamptz not null,
   status            public.post_status not null default 'scheduled',
   attempts          int not null default 0 check (attempts >= 0),
@@ -68,6 +74,7 @@ create table if not exists public.scheduled_posts (
 create index if not exists social_accounts_business_idx on public.social_accounts (business_id);
 create index if not exists posts_business_idx on public.posts (business_id);
 create index if not exists scheduled_posts_post_idx on public.scheduled_posts (post_id);
+create index if not exists scheduled_posts_business_idx on public.scheduled_posts (business_id);
 create index if not exists scheduled_posts_due_idx on public.scheduled_posts (scheduled_for);
 
 alter table public.social_accounts  enable row level security;
