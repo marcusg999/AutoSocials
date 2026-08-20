@@ -11,3 +11,11 @@ build/
 !.env.example
 tsconfig.tsbuildinfo
 next-env.d.ts
+
+# Local scratch. Security review work leaves throwaway attack scripts and
+# database bootstrappers at the root; they are not part of the project.
+/atk.sh
+/mkdb.ts
+/scratch/
+*.local.ts
+*.local.sh
