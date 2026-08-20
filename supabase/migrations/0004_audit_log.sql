@@ -76,17 +76,34 @@ declare
   new_id bigint;
   actor  uuid;
 begin
-  -- The JWT always wins. p_actor_user_id is only consulted when there is no
-  -- session at all -- which happens exactly once, when our own server records a
-  -- FAILED login on behalf of someone who never got a session. Because the JWT
-  -- takes precedence, no session can ever use this parameter to impersonate.
-  actor := coalesce((select auth.uid()), p_actor_user_id);
+  -- p_actor_user_id is only for the no-session case: our own server recording a
+  -- FAILED login for someone who never got a session, or a worker acting on a
+  -- schedule. When a user JWT is present it wins and a conflicting caller-supplied
+  -- actor is a hard error rather than a silent override.
+  --
+  -- Do NOT read the precedence rule as a backstop against a compromised server.
+  -- A service-role JWT carries no `sub`, so auth.uid() is null on every call the
+  -- application actually makes, and this branch never fires there. The recorded
+  -- actor_source makes that visible in the row itself rather than implied.
+  if (select auth.uid()) is not null then
+    if p_actor_user_id is not null and p_actor_user_id <> (select auth.uid()) then
+      raise exception 'refusing to attribute an action to % while signed in as %',
+        p_actor_user_id, (select auth.uid())
+        using errcode = 'insufficient_privilege';
+    end if;
+    actor := (select auth.uid());
+  else
+    actor := p_actor_user_id;
+  end if;
 
   insert into public.audit_log
     (actor_user_id, business_id, action, target_type, target_id, metadata, ip)
   values
     (actor, p_business_id, p_action, p_target_type, p_target_id,
-     coalesce(p_metadata, '{}'::jsonb), p_ip)
+     coalesce(p_metadata, '{}'::jsonb)
+       || jsonb_build_object('actor_source',
+            case when (select auth.uid()) is not null then 'jwt' else 'caller' end),
+     p_ip)
   returning id into new_id;
   return new_id;
 end;

@@ -146,7 +146,9 @@ describe('QUALITY BAR: a cross-tenant write is rejected', () => {
       mallorysPost = r.rows[0].id
       const err = await expectRejected(() =>
         q(`update public.posts set business_id=$1 where id=$2`, [businessA, mallorysPost]))
-      expect(err.message).toMatch(/row-level security/i)
+      // business_id is outside the column-level UPDATE grant, so this is refused
+      // before RLS is even consulted. Denied earlier is denied better.
+      expect(err.message).toMatch(/permission denied|row-level security/i)
     })
   })
 

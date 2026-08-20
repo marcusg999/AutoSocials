@@ -14,13 +14,13 @@ import {
 export { CSRF_COOKIE_NAME, CSRF_FIELD_NAME }
 
 /**
- * Issues a brand-new CSRF token. Called after a successful sign-in and after
- * signing out, so a token minted before the session changed can never be reused
- * across it.
+ * Issues a brand-new CSRF token bound to the given user. Called after a successful
+ * sign-in, so the token that follows a session change belongs to the new session
+ * and a token minted before it cannot be reused across the boundary.
  */
-export async function rotateCsrfToken(): Promise<void> {
+export async function rotateCsrfToken(subject: string | null): Promise<void> {
   const cookieStore = await cookies()
-  cookieStore.set(CSRF_COOKIE_NAME, createCsrfToken(), csrfCookieOptions())
+  cookieStore.set(CSRF_COOKIE_NAME, createCsrfToken(subject), csrfCookieOptions())
 }
 
 /** Removes the token entirely, on sign-out. */
@@ -45,7 +45,7 @@ async function currentCsrfToken(): Promise<string> {
   const existing = cookieStore.get(CSRF_COOKIE_NAME)?.value
   if (existing) return existing
 
-  const token = createCsrfToken()
+  const token = createCsrfToken(await currentSubject())
   try {
     cookieStore.set(CSRF_COOKIE_NAME, token, csrfCookieOptions())
   } catch {
@@ -71,6 +71,7 @@ export async function csrfField() {
 export async function assertCsrf(formData: FormData): Promise<void> {
   await assertSameOrigin()
 
+  const subject = await currentSubject()
   const cookieStore = await cookies()
   const expected = cookieStore.get(CSRF_COOKIE_NAME)?.value
   const provided = formData.get(CSRF_FIELD_NAME)
@@ -79,7 +80,23 @@ export async function assertCsrf(formData: FormData): Promise<void> {
   if (typeof provided !== 'string' || provided.length === 0) {
     throw new CsrfError('no token in the submitted form')
   }
-  if (!csrfTokensMatch(expected, provided)) throw new CsrfError('token mismatch')
+  if (!csrfTokensMatch(expected, provided, subject)) {
+    throw new CsrfError('token mismatch, or the token was not issued to this session')
+  }
+}
+
+/**
+ * The signed-in user's id, or null before sign-in.
+ *
+ * Read straight from the verified session rather than from anything the request
+ * supplies, because it is half of what the CSRF token is signed over.
+ */
+async function currentSubject(): Promise<string | null> {
+  const { resolveSessionState } = await import('@/lib/security/session')
+  const state = await resolveSessionState()
+  if (state.status === 'verified') return state.session.userId
+  if (state.status === 'anonymous') return null
+  return state.user.id
 }
 
 /**

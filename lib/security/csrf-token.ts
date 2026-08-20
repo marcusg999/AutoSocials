@@ -13,7 +13,12 @@
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import type { NextRequest, NextResponse } from 'next/server'
 
-export const CSRF_COOKIE_NAME = 'pd_csrf'
+// The __Host- prefix is a browser-enforced rule: a cookie with this name may only
+// be set from a secure origin, for path '/', with no Domain attribute -- so no
+// sibling or parent subdomain can write it. That closes the cookie-planting step
+// the token binding above assumes an attacker might otherwise have.
+export const CSRF_COOKIE_NAME =
+  process.env.NODE_ENV === 'production' ? '__Host-pd_csrf' : 'pd_csrf'
 export const CSRF_FIELD_NAME = 'csrf_token'
 
 const TOKEN_LIFETIME_MS = 1000 * 60 * 60 * 8
@@ -30,22 +35,32 @@ function sign(payload: string): string {
   return createHmac('sha256', signingSecret()).update(payload).digest('base64url')
 }
 
-/** A token is `<nonce>.<expiry>.<signature>`. */
-export function createCsrfToken(): string {
+/**
+ * A token is `<nonce>.<expiry>.<signature>`, where the signature covers the user
+ * it was issued to.
+ *
+ * Binding to the user matters as much as signing. A signature alone proves the
+ * server minted the token, but not that it minted it FOR YOU -- so any legitimate
+ * user could read their own cookie value and replay it as somebody else, given a
+ * way to plant a cookie. `subject` is the signed-in user's id, or the empty string
+ * before sign-in (the login form itself), and a token minted for one never
+ * verifies against the other.
+ */
+export function createCsrfToken(subject: string | null): string {
   const nonce = randomBytes(32).toString('base64url')
   const expiry = String(Date.now() + TOKEN_LIFETIME_MS)
-  return `${nonce}.${expiry}.${sign(`${nonce}.${expiry}`)}`
+  return `${nonce}.${expiry}.${sign(`${nonce}.${expiry}.${subject ?? ''}`)}`
 }
 
-/** True only for a token this server signed, that has not expired. */
-export function isValidCsrfToken(token: string): boolean {
+/** True only for an unexpired token this server signed for this same user. */
+export function isValidCsrfToken(token: string, subject: string | null): boolean {
   const parts = token.split('.')
   if (parts.length !== 3) return false
 
   const [nonce, expiry, signature] = parts as [string, string, string]
   if (!/^\d+$/.test(expiry) || Number(expiry) < Date.now()) return false
 
-  return constantTimeEquals(signature, sign(`${nonce}.${expiry}`))
+  return constantTimeEquals(signature, sign(`${nonce}.${expiry}.${subject ?? ''}`))
 }
 
 export function csrfCookieOptions() {
@@ -69,9 +84,9 @@ export function constantTimeEquals(expected: string, provided: string): boolean 
   return timingSafeEqual(a, b)
 }
 
-/** Both halves must match each other AND be a token this server actually signed. */
-export function csrfTokensMatch(expected: string, provided: string): boolean {
-  if (!isValidCsrfToken(expected)) return false
+/** Both halves must match each other AND be a token this server signed for this user. */
+export function csrfTokensMatch(expected: string, provided: string, subject: string | null): boolean {
+  if (!isValidCsrfToken(expected, subject)) return false
   return constantTimeEquals(expected, provided)
 }
 
@@ -84,11 +99,11 @@ export function csrfTokensMatch(expected: string, provided: string): boolean {
  * The new token is written onto the *request* as well, so the page rendered on this
  * very request embeds the same value the browser is about to store.
  */
-export function issueCsrfToken(request: NextRequest): { token: string; isNew: boolean } {
+export function issueCsrfToken(request: NextRequest, subject: string | null): { token: string; isNew: boolean } {
   const existing = request.cookies.get(CSRF_COOKIE_NAME)?.value
-  if (existing && isValidCsrfToken(existing)) return { token: existing, isNew: false }
+  if (existing && isValidCsrfToken(existing, subject)) return { token: existing, isNew: false }
 
-  const token = createCsrfToken()
+  const token = createCsrfToken(subject)
   request.cookies.set(CSRF_COOKIE_NAME, token)
   return { token, isNew: true }
 }

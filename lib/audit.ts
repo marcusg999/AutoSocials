@@ -15,14 +15,29 @@ export type AuditEntry = {
 }
 
 /**
- * Best-effort read of the caller's address. Everything after the first entry of
- * X-Forwarded-For was appended by upstream proxies we do not control, so only the
- * first hop is recorded, and only if it parses as an address the `inet` column accepts.
+ * The caller's address, taken from the END of X-Forwarded-For.
+ *
+ * This is the opposite of the obvious choice and the reason matters. An appending
+ * proxy (nginx's proxy_add_x_forwarded_for, an ALB, HAProxy) produces
+ * `<whatever the client sent>, <the address the proxy actually saw>`. Taking
+ * entry [0] therefore records a value the client chose -- on exactly the
+ * failed-login rows whose purpose is spotting credential stuffing.
+ *
+ * TRUSTED_PROXY_COUNT says how many hops we control. The address we want is that
+ * many entries from the end.
  */
 export async function clientIp(): Promise<string | null> {
   const headerList = await headers()
   const forwarded = headerList.get('x-forwarded-for')
-  const candidate = forwarded?.split(',')[0]?.trim() ?? headerList.get('x-real-ip')?.trim() ?? null
+
+  let candidate: string | null = null
+  if (forwarded) {
+    const hops = forwarded.split(',').map((hop) => hop.trim()).filter(Boolean)
+    const trusted = Number(process.env.TRUSTED_PROXY_COUNT ?? '1')
+    const index = hops.length - Math.max(1, Number.isFinite(trusted) ? trusted : 1)
+    candidate = hops[Math.max(0, index)] ?? null
+  }
+  candidate ??= headerList.get('x-real-ip')?.trim() ?? null
   if (!candidate) return null
 
   // Strip an IPv4 port suffix such as "203.0.113.4:51234".

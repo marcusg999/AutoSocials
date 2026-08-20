@@ -27,11 +27,38 @@ revoke all on all sequences in schema public from anon, authenticated;
 alter default privileges in schema public revoke all on tables    from anon, authenticated;
 alter default privileges in schema public revoke all on sequences from anon, authenticated;
 
+-- Functions need the same treatment, and the danger is different: a new function is
+-- not granted to `anon` by Supabase, it is executable by PUBLIC because that is the
+-- Postgres default for EVERY function ever created. Combined with
+-- `grant usage on schema app to authenticated`, that makes the next SECURITY DEFINER
+-- helper anyone writes an RLS bypass on the day it is created.
+--
+-- Note the missing `in schema` clause, which is NOT an oversight. Postgres accepts
+-- `alter default privileges in schema app revoke execute on functions from public`,
+-- reports success, stores nothing, and changes nothing -- a silent no-op. The
+-- built-in PUBLIC EXECUTE default is global, so only an unqualified statement can
+-- cancel it. Verified: with `in schema`, a newly created function is still
+-- PUBLIC-executable; without it, it is not.
+--
+-- The consequence is deliberate: from here on every function needs an explicit
+-- grant to be callable, including any PostgREST RPC a later phase adds. That is
+-- the posture this schema already follows everywhere else.
+alter default privileges revoke execute on functions from public;
+
 -- `anon` is granted nothing at all: a signed-out visitor cannot touch any table.
-grant select, insert, update, delete on public.businesses        to authenticated;
+grant select                          on public.businesses        to authenticated;
+
+-- businesses is granted UPDATE column by column. A table-wide grant let an owner
+-- rewrite created_by -- forging provenance, and turning the foreign key into a
+-- platform-wide "does this user exist?" probe -- and rewrite created_at.
+grant update (name, timezone)         on public.businesses        to authenticated;
 grant select, insert, update, delete on public.business_members  to authenticated;
 grant select, delete                 on public.social_accounts   to authenticated;
-grant select, insert, update, delete on public.posts             to authenticated;
+grant select, insert, delete          on public.posts             to authenticated;
+
+-- posts is granted UPDATE column by column, excluding created_by: authorship is
+-- set once, at insert, and is never editable afterwards.
+grant update (status, body)           on public.posts             to authenticated;
 grant select, insert, update, delete on public.scheduled_posts   to authenticated;
 grant select                          on public.audit_log        to authenticated;
 
@@ -178,16 +205,17 @@ create policy posts_insert_own_business on public.posts for insert to authentica
     and created_by = (select auth.uid())
   );
 
--- Only an owner or manager may edit a post; it must stay in the same business and keep its author.
+-- Only an owner or manager may edit a post, and only within their own business.
+--
+-- Authorship is not mentioned here on purpose. An earlier version required
+-- `created_by = auth.uid()` on the NEW row, which meant a manager editing a
+-- colleague's post had to reassign it to themselves for the update to pass -- the
+-- exact opposite of what its comment claimed. created_by is now pinned by a
+-- trigger and is not in the UPDATE grant at all, so it cannot change by any route.
 drop policy if exists posts_update_own_business on public.posts;
 create policy posts_update_own_business on public.posts for update to authenticated
   using      (app.has_role_in(business_id, array['owner','manager']::public.member_role[]))
-  with check (
-    app.has_role_in(business_id, array['owner','manager']::public.member_role[])
-    -- Not "null or self": allowing null would let an owner erase authorship, and
-    -- the audit row records which column changed but never its old value.
-    and created_by = (select auth.uid())
-  );
+  with check (app.has_role_in(business_id, array['owner','manager']::public.member_role[]));
 
 -- Only an owner or manager may delete a post.
 drop policy if exists posts_delete_own_business on public.posts;
@@ -198,9 +226,10 @@ create policy posts_delete_own_business on public.posts for delete to authentica
 -- ===========================================================================
 -- scheduled_posts
 --
--- This table has no business_id of its own, so it inherits its tenant from the
--- post it schedules. Every write also checks the target social account, because
--- otherwise you could aim your own post at someone else's connected account.
+-- This table carries its own business_id, denormalized from the parent post so a
+-- cascade delete stays attributable. Every write checks that the post AND the
+-- target social account both sit in that same business -- otherwise you could aim
+-- your own post at someone else's connected account.
 -- ===========================================================================
 
 -- You can see a scheduled post only if you are a member of the business it belongs to.

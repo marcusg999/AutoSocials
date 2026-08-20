@@ -15,6 +15,7 @@ let url: string
 const OWNER = '11111111-1111-1111-1111-111111111111'
 const VIEWER = '33333333-3333-3333-3333-333333333333'
 const OUTSIDER = '22222222-2222-2222-2222-222222222222'
+const MANAGER = '55555555-5555-5555-5555-555555555555'
 
 let businessA: string
 let businessB: string
@@ -27,8 +28,9 @@ beforeAll(async () => {
   url = await freshDatabase(DB)
   await asAdmin(url, async (q) => {
     await q(`insert into auth.users (id, email) values
-      ($1,'owner@example.com'), ($2,'viewer@example.com'), ($3,'outsider@example.com')`,
-      [OWNER, VIEWER, OUTSIDER])
+      ($1,'owner@example.com'), ($2,'viewer@example.com'), ($3,'outsider@example.com'),
+      ($4,'manager@example.com')`,
+      [OWNER, VIEWER, OUTSIDER, MANAGER])
 
     businessA = (await q(`insert into public.businesses (name) values ('Tenant A') returning id`)).rows[0].id
     businessB = (await q(`insert into public.businesses (name) values ('Tenant B') returning id`)).rows[0].id
@@ -256,18 +258,21 @@ describe('M2 — a cascade delete still produces an attributable audit row', () 
 // ---------------------------------------------------------------------------
 
 describe('CLASS: no function in schema app is executable by PUBLIC', () => {
-  test('every app function has an explicit ACL', async () => {
-    // A SECURITY DEFINER function left PUBLIC-executable is an RLS bypass handed to
-    // anyone with a SQL channel. One such function was missed by hand; this checks
-    // all of them, including any a future migration adds.
+  test('PUBLIC cannot execute any of them', async () => {
+    // Ask Postgres the actual question. An earlier version asserted
+    // `proacl is not null`, which is a PROXY for the property and not the property:
+    // the moment any grant is issued Postgres materialises the ACL *including* the
+    // default PUBLIC entry, so a function that was both PUBLIC-executable and
+    // explicitly granted passed. has_function_privilege cannot be fooled that way.
     await asAdmin(url, async (q) => {
       const r = await q(`
-        select proname, proacl::text as acl, prosecdef
+        select p.proname,
+               has_function_privilege('public', p.oid, 'EXECUTE') as public_can_execute
         from pg_proc p join pg_namespace n on n.oid = p.pronamespace
-        where n.nspname = 'app' order by proname`)
+        where n.nspname = 'app' order by p.proname`)
       expect(r.rowCount).toBeGreaterThan(0)
       for (const fn of r.rows) {
-        expect(fn.acl, `app.${fn.proname} is executable by PUBLIC`).not.toBeNull()
+        expect(fn.public_can_execute, `app.${fn.proname} is executable by PUBLIC`).toBe(false)
       }
     })
   })
@@ -285,6 +290,29 @@ describe('CLASS: no function in schema app is executable by PUBLIC', () => {
 })
 
 describe('CLASS: anon is granted nothing, now and for future migrations', () => {
+  test('a FUNCTION created by a later migration is not executable by PUBLIC', async () => {
+    // The table half of this was fixed first and the function half was missed.
+    // Functions default to PUBLIC EXECUTE, and `authenticated` holds usage on both
+    // schemas, so a new SECURITY DEFINER helper is reachable by anyone until the
+    // default privilege itself is cancelled.
+    await asAdmin(url, async (q) => {
+      await q(`create function app.future_helper() returns text
+               language sql security definer set search_path='' as $$ select 'ran' $$`)
+      await q(`create function public.future_public_helper() returns text
+               language sql security definer set search_path='' as $$ select 'ran' $$`)
+      try {
+        const r = await q(`
+          select has_function_privilege('public','app.future_helper()','EXECUTE')            as app_fn,
+                 has_function_privilege('public','public.future_public_helper()','EXECUTE')   as public_fn`)
+        expect(r.rows[0].app_fn,    'a new app function is PUBLIC-executable').toBe(false)
+        expect(r.rows[0].public_fn, 'a new public function is PUBLIC-executable').toBe(false)
+      } finally {
+        await q(`drop function app.future_helper()`)
+        await q(`drop function public.future_public_helper()`)
+      }
+    })
+  })
+
   test('a table created by a later migration is not granted to anon', async () => {
     // Supabase's default privileges grant ALL on new public tables to anon. A
     // one-time revoke fixes today's tables; the next migration reopens the hole
@@ -395,12 +423,44 @@ describe('the Vault write path is audited, including a rotation', () => {
   })
 })
 
-test('authorship cannot be erased', async () => {
-  await asUser(url, OWNER, 'aal2', async (q) => {
-    const id = (await q(`insert into public.posts (business_id, created_by, body) values ($1,$2,'{}') returning id`,
-      [businessA, OWNER])).rows[0].id
-    const err = await expectRejected(() =>
-      q(`update public.posts set created_by = null where id = $1`, [id]))
-    expect(err.message).toMatch(/row-level security/i)
+describe('authorship is set once and never changes', () => {
+  test('created_by is not in the UPDATE grant at all', async () => {
+    await asAdmin(url, async (q) => {
+      const r = await q(`
+        select has_column_privilege('authenticated','public.posts','created_by','UPDATE') as upd,
+               has_column_privilege('authenticated','public.posts','business_id','UPDATE') as biz`)
+      expect(r.rows[0].upd, 'created_by is editable').toBe(false)
+      expect(r.rows[0].biz, 'business_id is editable, so a post could be moved between tenants').toBe(false)
+    })
+  })
+
+  test('a trigger pins it even for a caller that bypasses the grant', async () => {
+    // Belt and braces: the grant stops the app, the trigger stops a worker or a
+    // migration running as the owner.
+    let id: string
+    await asAdmin(url, async (q) => {
+      id = (await q(`insert into public.posts (business_id, created_by, body) values ($1,$2,'{}') returning id`,
+        [businessA, OWNER])).rows[0].id
+      await q(`update public.posts set created_by = null where id = $1`, [id])
+      const after = await q(`select created_by from public.posts where id = $1`, [id])
+      expect(after.rows[0].created_by, 'authorship was erased').toBe(OWNER)
+    })
+  })
+
+  test('a manager can edit a colleague\'s post without stealing authorship', async () => {
+    // The regression: requiring created_by = auth.uid() on the NEW row made
+    // collaborative editing impossible and left reassignment as the only way through.
+    let id: string
+    await asAdmin(url, async (q) => {
+      id = (await q(`insert into public.posts (business_id, created_by, body) values ($1,$2,'{}') returning id`,
+        [businessA, OWNER])).rows[0].id
+      await q(`insert into public.business_members (business_id, user_id, role) values ($1,$2,'manager')
+               on conflict do nothing`, [businessA, MANAGER])
+    })
+    await asUser(url, MANAGER, 'aal2', async (q) => {
+      const r = await q(`update public.posts set status='approved' where id=$1 returning created_by`, [id])
+      expect(r.rowCount, 'a manager could not edit a colleague\'s post').toBe(1)
+      expect(r.rows[0].created_by, 'authorship changed hands').toBe(OWNER)
+    })
   })
 })

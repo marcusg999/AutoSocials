@@ -28,6 +28,17 @@ export async function verifyFactorAction(formData: FormData): Promise<void> {
   const { data: challenge, error: challengeError } = await supabase.auth.mfa.challenge({ factorId })
   if (challengeError || !challenge) redirect(`${MFA_VERIFY_PATH}?error=challenge_failed`)
 
+  // Recorded before the verify call, because a successful verify upgrades the
+  // session to aal2 immediately. If the row were only written afterwards and that
+  // write failed, the request would 500 while the caller walked away holding a
+  // fully privileged session with no record of how they got it.
+  await recordAuditOrThrow({
+    action: 'auth.mfa.verify.attempt',
+    targetType: 'mfa_factor',
+    targetId: factorId,
+    actorUserId: user.id,
+  })
+
   const { error: verifyError } = await supabase.auth.mfa.verify({
     factorId,
     challengeId: challenge.id,

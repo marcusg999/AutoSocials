@@ -54,11 +54,17 @@ export async function resolveSessionState(): Promise<SessionState> {
   if (user.id !== claimsData.claims.sub) return { status: 'anonymous' }
 
   const aal = typeof claimsData.claims.aal === 'string' ? claimsData.claims.aal : 'aal1'
-  if (aal === 'aal2') {
+  const hasVerifiedFactor = (user.factors ?? []).some((factor) => factor.status === 'verified')
+
+  // Both halves are required, not just the claim. A JWT stamped aal2 stays valid
+  // for its whole lifetime, so checking the claim alone would keep a session fully
+  // privileged after its TOTP factor had been removed -- "password plus TOTP" with
+  // no TOTP left in existence. getUser() already fetched the factor list, so this
+  // costs nothing.
+  if (aal === 'aal2' && hasVerifiedFactor) {
     return { status: 'verified', session: { supabase, userId: user.id, email: user.email ?? null } }
   }
 
-  const hasVerifiedFactor = (user.factors ?? []).some((factor) => factor.status === 'verified')
   return { status: hasVerifiedFactor ? 'needs-verification' : 'needs-enrollment', supabase, user }
 }
 
@@ -92,19 +98,13 @@ export async function requireMfaSessionOrThrow(): Promise<MfaSession> {
 }
 
 /**
- * Weaker guard used ONLY by the MFA enrol/verify screens, which by definition run
+ * Weaker guard used ONLY by the MFA enrol/verify actions, which by definition run
  * before aal2 exists. It still proves the password step really happened.
+ *
+ * There is deliberately no redirect-flavoured twin: an unused guard is one nobody
+ * has ever exercised, and it would still count as "guarded" to the structural test
+ * in tests/app/guards.test.ts.
  */
-export async function requireSignedInUser(): Promise<PartialSession> {
-  const state = await resolveSessionState()
-  if (state.status === 'anonymous') redirect(LOGIN_PATH)
-  if (state.status === 'verified') {
-    return { supabase: state.session.supabase, user: await reloadUser(state.session.supabase) }
-  }
-  return { supabase: state.supabase, user: state.user }
-}
-
-/** Same as requireSignedInUser but throws, for the MFA server actions. */
 export async function requireSignedInUserOrThrow(): Promise<PartialSession> {
   const state = await resolveSessionState()
   if (state.status === 'anonymous') throw new NotAuthorisedError('anonymous')

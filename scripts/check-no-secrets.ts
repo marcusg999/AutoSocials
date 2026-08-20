@@ -8,7 +8,7 @@
  *
  *   npm run test:secrets
  */
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, rmSync } from 'node:fs'
 import { join, relative } from 'node:path'
 
@@ -107,7 +107,18 @@ function checkAdminClientIsServerOnly() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. The real proof: build with canary secrets, then grep the client bundle.
+// 4. The real proof: build with canary secrets, serve the app, and read every
+//    route the way a browser would.
+//
+//    An earlier version grepped `.next/static` plus any prerendered files. That is
+//    structurally blind to this app: every page sets `dynamic = 'force-dynamic'`,
+//    so nothing is prerendered and `.next/static` can never contain a value that is
+//    serialized at REQUEST time. A server component passing a secret to a client
+//    component puts it in the RSC flight payload of the live response -- exactly
+//    where the old scan could not look. Verified: that leak passed the old check
+//    and was visible twice in `curl` output.
+//
+//    So the scan now happens against a running server.
 // ---------------------------------------------------------------------------
 const CANARIES = {
   SUPABASE_SERVICE_ROLE_KEY: 'CANARY_SERVICE_ROLE_a1b2c3d4e5f6a7b8',
@@ -115,66 +126,148 @@ const CANARIES = {
   CSRF_SIGNING_SECRET: 'CANARY_CSRF_SECRET_5a4b3c2d1e0f9887_at_least_32_chars',
 } as const
 
-function checkBuiltBundle() {
-  const buildEnv = {
+const PORT = 3987
+const ORIGIN = `http://127.0.0.1:${PORT}`
+
+function buildEnvironment(): NodeJS.ProcessEnv {
+  return {
     ...process.env,
     ...CANARIES,
     NEXT_PUBLIC_SUPABASE_URL: process.env.NEXT_PUBLIC_SUPABASE_URL ?? 'https://example.supabase.co',
     NEXT_PUBLIC_SUPABASE_ANON_KEY: process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? 'public-anon-key-safe-to-ship',
-    APP_ORIGIN: process.env.APP_ORIGIN ?? 'https://postdeck.example.com',
+    APP_ORIGIN: ORIGIN,
     NEXT_TELEMETRY_DISABLED: '1',
   }
+}
 
+/** Every route the app serves, read from Next's own manifest. */
+function routesFromManifest(): string[] {
+  const manifestPath = join(ROOT, '.next/server/app-paths-manifest.json')
+  if (!existsSync(manifestPath)) return []
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, string>
+  const routes = new Set<string>()
+  for (const key of Object.keys(manifest)) {
+    const route = key.replace(/\/(page|route)$/, '')
+    // Skip Next's internal error pages and any dynamic segment we cannot fill in.
+    if (route.startsWith('/_')) continue
+    if (route.includes('[')) continue
+    routes.add(route === '' ? '/' : route)
+  }
+  return [...routes]
+}
+
+async function fetchText(url: string, headers: Record<string, string> = {}): Promise<string> {
+  try {
+    const response = await fetch(url, { headers, redirect: 'manual' })
+    const body = await response.text()
+    // Header values count too: a secret in a Set-Cookie or a custom header ships.
+    const headerText = [...response.headers.entries()].map(([k, v]) => `${k}: ${v}`).join('\n')
+    return `${headerText}\n${body}`
+  } catch (err) {
+    return ''
+  }
+}
+
+async function waitForServer(): Promise<boolean> {
+  for (let attempt = 0; attempt < 60; attempt++) {
+    try {
+      await fetch(`${ORIGIN}/login`, { redirect: 'manual' })
+      return true
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 500))
+    }
+  }
+  return false
+}
+
+async function checkServedResponses() {
   console.log('  building with canary secrets in the server environment...')
   rmSync(join(ROOT, '.next'), { recursive: true, force: true })
   try {
-    execFileSync('npx', ['next', 'build'], { cwd: ROOT, env: buildEnv, stdio: 'pipe', encoding: 'utf8' })
+    execFileSync('npx', ['next', 'build'], { cwd: ROOT, env: buildEnvironment(), stdio: 'pipe', encoding: 'utf8' })
   } catch (err: any) {
-    fail(`next build failed, so the bundle could not be scanned:\n${err.stdout ?? ''}${err.stderr ?? ''}`)
+    fail(`next build failed, so nothing could be scanned:\n${err.stdout ?? ''}${err.stderr ?? ''}`)
     return
   }
 
-  // Everything the browser can receive. That is more than the JS chunks: a server
-  // component that accidentally passes a secret as a prop serialises it into the
-  // RSC flight payload embedded in the prerendered HTML, which .next/static does
-  // not contain. Both are scanned.
-  const chunkFiles = walk(join(ROOT, '.next/static'))
-  const renderedFiles = walk(join(ROOT, '.next/server/app'))
-    .filter((f) => /\.(html|rsc|body)$/.test(f))
-  const clientFiles = [...chunkFiles, ...renderedFiles]
+  const routes = routesFromManifest()
+  if (routes.length === 0) {
+    fail('no routes were found in the build manifest — the scan would have been vacuous')
+    return
+  }
 
-  if (!chunkFiles.length) { fail('.next/static is empty — nothing was scanned'); return }
+  console.log(`  serving the app and reading ${routes.length} route(s) as a browser would...`)
+  const server = spawn('npx', ['next', 'start', '-p', String(PORT)], {
+    cwd: ROOT, env: buildEnvironment(), stdio: 'ignore', detached: true,
+  })
 
   const found: string[] = []
-  for (const file of clientFiles) {
+  let scanned = 0
+  try {
+    if (!(await waitForServer())) {
+      fail('the app did not start, so no served response could be scanned')
+      return
+    }
+
+    for (const route of routes) {
+      const documents: Array<[string, string]> = [
+        [`${route} (HTML)`, await fetchText(`${ORIGIN}${route}`)],
+        // The RSC flight payload: what a client-side navigation receives, and where
+        // a server-to-client prop actually lands.
+        [`${route} (RSC flight)`, await fetchText(`${ORIGIN}${route}`, { RSC: '1' })],
+      ]
+      for (const [label, text] of documents) {
+        scanned++
+        for (const [name, canary] of Object.entries(CANARIES)) {
+          if (text.includes(canary)) found.push(`${name} leaked into the response for ${label}`)
+        }
+        if (/service_role/.test(text)) found.push(`the string "service_role" appears in the response for ${label}`)
+      }
+    }
+  } finally {
+    try { process.kill(-server.pid!, 'SIGKILL') } catch { /* already gone */ }
+  }
+
+  // The static chunks are still worth checking: a secret inlined at BUILD time
+  // lands there instead.
+  const chunkFiles = walk(join(ROOT, '.next/static'))
+  for (const file of chunkFiles) {
     const text = readFileSync(file, 'utf8')
     for (const [name, canary] of Object.entries(CANARIES)) {
       if (text.includes(canary)) found.push(`${name} leaked into ${relative(ROOT, file)}`)
     }
-    // Also catch anything shaped like a Supabase service key or a JWT with the
-    // service_role claim, in case a real key were ever hardcoded.
     if (/service_role/.test(text)) found.push(`the string "service_role" appears in ${relative(ROOT, file)}`)
   }
 
-  if (found.length) fail(`SECRETS FOUND IN THE CLIENT BUNDLE:\n    ${found.join('\n    ')}`)
-  else pass(`no server-only secret appears in any of ${clientFiles.length} browser-reachable files `
-    + `(${chunkFiles.length} JS chunks, ${renderedFiles.length} prerendered/RSC payloads)`)
+  if (found.length) {
+    fail(`SECRETS REACHABLE BY THE BROWSER:\n    ${found.join('\n    ')}`)
+  } else {
+    pass(`no server-only secret appears in any of ${scanned} served responses `
+      + `or ${chunkFiles.length} static chunks`)
+  }
 }
 
 // ---------------------------------------------------------------------------
 
-console.log('\nSecret-leak check\n' + '='.repeat(60))
-checkGitTracked()
-checkPublicVarNames()
-checkAdminClientIsServerOnly()
-checkBuiltBundle()
+async function main() {
+  console.log('\nSecret-leak check\n' + '='.repeat(60))
+  checkGitTracked()
+  checkPublicVarNames()
+  checkAdminClientIsServerOnly()
+  await checkServedResponses()
 
-for (const p of passes) console.log(`  PASS  ${p}`)
-for (const f of failures) console.error(`  FAIL  ${f}`)
-console.log('='.repeat(60))
+  for (const p of passes) console.log(`  PASS  ${p}`)
+  for (const f of failures) console.error(`  FAIL  ${f}`)
+  console.log('='.repeat(60))
 
-if (failures.length) {
-  console.error(`\n${failures.length} secret-handling check(s) failed.\n`)
-  process.exit(1)
+  if (failures.length) {
+    console.error(`\n${failures.length} secret-handling check(s) failed.\n`)
+    process.exit(1)
+  }
+  console.log(`\nAll ${passes.length} secret-handling checks passed.\n`)
 }
-console.log(`\nAll ${passes.length} secret-handling checks passed.\n`)
+
+main().catch((error) => {
+  console.error(error)
+  process.exit(1)
+})

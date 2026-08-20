@@ -4,7 +4,7 @@ import { redirect } from 'next/navigation'
 
 import { assertCsrf } from '@/lib/security/csrf'
 import { NotAuthorisedError, requireSignedInUserOrThrow } from '@/lib/security/session'
-import { recordAudit, recordAuditOrThrow } from '@/lib/audit'
+import { recordAuditOrThrow } from '@/lib/audit'
 import { DASHBOARD_PATH, MFA_ENROLL_PATH } from '@/lib/security/routes'
 
 const SIX_DIGITS = /^\d{6}$/
@@ -35,6 +35,17 @@ export async function confirmEnrollmentAction(formData: FormData): Promise<void>
 
   const { data: challenge, error: challengeError } = await supabase.auth.mfa.challenge({ factorId })
   if (challengeError || !challenge) redirect(`${MFA_ENROLL_PATH}?error=challenge_failed`)
+
+  // Recorded before the verify call, because a successful verify upgrades the
+  // session to aal2 immediately. If the row were only written afterwards and that
+  // write failed, the request would 500 while the caller walked away holding a
+  // fully privileged session with no record of how they got it.
+  await recordAuditOrThrow({
+    action: 'auth.mfa.enroll.attempt',
+    targetType: 'mfa_factor',
+    targetId: factorId,
+    actorUserId: user.id,
+  })
 
   const { error: verifyError } = await supabase.auth.mfa.verify({
     factorId,
@@ -81,13 +92,16 @@ export async function restartEnrollmentAction(formData: FormData): Promise<void>
   const { data: factors } = await supabase.auth.mfa.listFactors()
   for (const factor of factors?.all ?? []) {
     if (factor.factor_type === 'totp' && factor.status === 'unverified') {
-      await supabase.auth.mfa.unenroll({ factorId: factor.id })
-      await recordAudit({
+      // Recorded before the factor is destroyed, and fatal if it cannot be
+      // recorded. Of every mutation in this phase, discarding an authentication
+      // factor is the last one that should be allowed to happen unlogged.
+      await recordAuditOrThrow({
         action: 'auth.mfa.enroll.restart',
         targetType: 'mfa_factor',
         targetId: factor.id,
         actorUserId: user.id,
       })
+      await supabase.auth.mfa.unenroll({ factorId: factor.id })
     }
   }
 

@@ -16,11 +16,22 @@ export async function signInAction(formData: FormData): Promise<void> {
   // Layer 2 for this action: a mutation is never accepted on the proxy's word alone.
   await assertCsrf(formData)
 
-  const email = String(formData.get('email') ?? '').trim()
+  // Capped at the RFC maximum. The failed-login path writes this into an
+  // append-only table that nothing can prune, so an unbounded value from an
+  // unauthenticated caller is a permanent, attacker-controlled write primitive.
+  const email = String(formData.get('email') ?? '').trim().slice(0, 320)
   const password = String(formData.get('password') ?? '')
   if (!email || !password) redirect(`${LOGIN_PATH}?error=missing`)
 
   const supabase = await createSupabaseServerClient()
+
+  // Written before the attempt, not after. signInWithPassword() writes session
+  // cookies; if the audit row were only written afterwards and that write failed,
+  // the user would be signed in with no record of it -- the single event most
+  // worth having. Recording the attempt first means the trail can never be
+  // silently shorter than reality.
+  await recordAuditOrThrow({ action: 'auth.login.attempt', metadata: { email } })
+
   const { error } = await supabase.auth.signInWithPassword({ email, password })
 
   if (error) {
@@ -38,10 +49,12 @@ export async function signInAction(formData: FormData): Promise<void> {
 
   // A new session gets a new CSRF token, so one minted before sign-in -- possibly
   // by somebody else -- can never be replayed across the boundary.
-  await rotateCsrfToken()
-
   // The user id comes from the session we just established, not from the form.
   const { data: signedIn } = await supabase.auth.getUser()
+
+  // The new token is bound to the new user, so the pre-login one cannot cross the
+  // session boundary.
+  await rotateCsrfToken(signedIn.user?.id ?? null)
   await recordAuditOrThrow({ action: 'auth.login.success', actorUserId: signedIn.user?.id ?? null })
 
   // A password is only the first factor; where to go next depends on MFA state.

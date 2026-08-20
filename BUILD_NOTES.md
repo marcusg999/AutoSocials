@@ -391,6 +391,158 @@ somebody adds next year, which no hand-written per-route test can.
 
 ---
 
+## Gotchas found by the third adversarial review
+
+Round 3 verified each earlier fix by attacking it — ten of twelve held. Its central
+result was harsher than any individual finding: **the verification layer was weaker
+than the thing it verified, and weakest exactly where rounds 1 and 2 had declared
+victory.** Three of the four "class" tests, and the secret scanner, asserted a
+*proxy* for their property rather than the property, and all four were made green
+while the property was false.
+
+### G36 — `proacl is not null` is not "PUBLIC cannot execute"
+The class test guarding against a PUBLIC-executable `SECURITY DEFINER` function
+checked that the function had *some* ACL. But `proacl` is null only when no grant
+has ever been issued; the moment any grant exists Postgres materialises the ACL
+**including the default PUBLIC entry**. A function that was both granted and
+PUBLIC-executable sailed through. Verified:
+
+```
+proname=future_helper | my_class_test_passes(proacl is not null)=true | PUBLIC_CAN_ACTUALLY_EXECUTE=true
+```
+
+Now asks `has_function_privilege('public', p.oid, 'EXECUTE')`, which cannot be
+satisfied by anything except the fact itself.
+
+### G37 — `ALTER DEFAULT PRIVILEGES IN SCHEMA x REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC` is a silent no-op
+The most surprising thing found in three rounds. Round 2 cancelled the default
+privilege for tables and sequences; functions were missed, so the next migration's
+helper was PUBLIC-executable again. The obvious fix did not work — and did not
+complain:
+
+```
+alter default privileges in schema app revoke execute on functions from public;   -- "ALTER DEFAULT PRIVILEGES"
+create function app.probe1() ...;
+probe1 PUBLIC-exec = true      <-- unchanged, and no pg_default_acl row was written
+
+alter default privileges revoke execute on functions from public;                 -- no IN SCHEMA
+create function app.probe2() ...;
+probe2 PUBLIC-exec = false     <-- works
+```
+
+Postgres's built-in `PUBLIC EXECUTE` on functions is a global default, so a
+schema-scoped revoke has nothing to subtract and is dropped. Only the unqualified
+form cancels it. **A statement that reports success and stores nothing is worse
+than one that errors.**
+
+### G38 — `export const x = async () => {}` is a server action too
+The structural test asserting that every server action checks CSRF and establishes
+its own session matched only `export async function`. An action declared as an
+arrow function was invisible to every check in the file — which is precisely the
+"someone adds one next year and forgets" case the file exists to catch. Adding an
+unguarded `nukeAction` left the suite at **24/24 green**.
+
+It now matches all three declaration forms, and — more importantly — separately
+asserts that the set of recognised actions equals the set of *all* exported
+bindings, so a form nobody anticipated fails loudly instead of being skipped
+silently. Re-verified: the same unguarded action now fails two tests.
+
+### G39 — The secret scanner could not see a single application page
+`scripts/check-no-secrets.ts` grepped `.next/static` plus any prerendered output.
+Every page in this app sets `dynamic = 'force-dynamic'`, so **nothing is
+prerendered** — `.next/server/app` held only `_not-found` and `_global-error` — and
+`.next/static` can never contain a value serialized at *request* time. The scan was
+structurally blind to 100% of the app.
+
+Proven by planting the leak it exists to catch: a client component receiving
+`process.env.SUPABASE_SERVICE_ROLE_KEY` as a prop. The check printed
+`All 6 secret-handling checks passed`, exit 0, while the canary was visible twice
+in `curl` output — once in the HTML, once in the RSC flight payload.
+
+The scanner now builds with canaries, **starts the app**, enumerates every route
+from Next's own manifest, and reads each one as HTML and as an RSC flight response,
+headers included. Re-verified: the same leak now fails the check and exits 1.
+
+The blind spot was getting *less* likely to fire as the app grew — Phase 1 has one
+client component, and Phase 2 is when they arrive.
+
+### G40 — "The JWT always wins" never fired in production
+`app.write_audit` preferred `auth.uid()` over the caller-supplied actor, and
+`lib/audit.ts` cited that as a database-side backstop against impersonation. But a
+Supabase **service-role** JWT carries no `sub` claim, and the service-role client is
+the only caller — so `auth.uid()` is null on every call the app actually makes and
+the precedence rule never competed. The comment was false in the only configuration
+that ships.
+
+Now: a conflicting actor while a user JWT is present is a hard error rather than a
+silent override, and every row records `metadata.actor_source` as `jwt` or
+`caller`, so which one applied is a visible fact in the row instead of an
+assumption about a backstop.
+
+### G41 — A policy that enforced the opposite of its own comment
+`posts_update_own_business` said *"it must stay in the same business and keep its
+author"* and required `created_by = auth.uid()` on the **new** row — so a manager
+editing a colleague's post could not leave the author alone; the only route the
+policy left open was reassigning authorship to themselves. Collaborative editing
+was impossible and silent authorship theft was mandatory.
+
+`created_by` is now outside the UPDATE grant entirely and pinned by a
+`BEFORE UPDATE` trigger, so it cannot change by any route including a worker or a
+migration. Three tests cover it, one of which is specifically "a manager can edit a
+colleague's post without stealing authorship".
+
+This was also a criterion-6 failure, and the sharpest illustration of G20: **a
+one-sentence explanation that is false is worse than none, because the reader stops
+reading the policy.**
+
+### G42 — `X-Forwarded-For[0]` is the client's own claim
+The audit IP took the first entry, with a comment explaining that later entries were
+appended by proxies "we do not control". That is backwards: an appending ingress
+(nginx `proxy_add_x_forwarded_for`, ALB, HAProxy) produces
+`<whatever the client sent>, <the address the proxy actually saw>`. Every IP in the
+audit log was therefore attacker-chosen — including on the failed-login rows whose
+whole purpose is spotting credential stuffing. Now read from the end, offset by a
+configured `TRUSTED_PROXY_COUNT`.
+
+### G43 — An aal2 session outlived the factor that produced it
+`resolveSessionState` trusted the `aal` claim alone. A JWT stamped `aal2` stays
+valid for its whole lifetime, so a session remained fully privileged after its TOTP
+factor had been deleted — "password plus TOTP" with no TOTP left in existence. The
+factor list was already being fetched on the previous line; it is now checked.
+
+### G44 — Audit rows written after the mutation they describe
+`recordAuditOrThrow` was called *after* `signInWithPassword` and after
+`mfa.verify()`. Throwing does not undo a session: the user was signed in (or
+upgraded to aal2), the request 500'd, and no row existed. Anyone able to make the
+audit write fail could authenticate without a trace — the exact event the
+must-succeed path was introduced to guarantee. An attempt row is now written
+*before* each of those mutations, so the trail can never be shorter than reality.
+The same reordering applies to discarding an MFA factor.
+
+### G45 — A signed CSRF token still is not *your* token
+Round 2 signed the token so the server could prove it minted it. Round 3 pointed out
+that this does not prove it minted it **for you**: a legitimate user could read
+their own cookie value and replay it as anyone else, given a cookie-write primitive.
+The token is now signed over the session subject as well, so one user's valid token
+fails for another, and a pre-login token fails after login. In production the cookie
+also carries the `__Host-` prefix, which browsers refuse to let any subdomain write
+— closing the planting step the attack depends on.
+
+### G46 — An extension-based matcher exempts routes that do not exist yet
+The proxy matcher excluded anything ending `.txt` or `.xml`. Harmless in Phase 1,
+and an unguarded, header-less hole the day a later phase adds an export, a feed or
+a sitemap route handler. Exclusions are now by location (`_next/static`,
+`_next/image`, `favicon.ico`), never by extension.
+
+### G47 — Unbounded, unauthenticated, permanently unremovable audit writes
+`signInAction` stored the submitted email verbatim on failure, with no length bound
+(`<input type="email">` is client-side only) and no rate limiting. A 500 KB value
+was accepted, and the append-only triggers mean nothing — not the owner, not
+`service_role` — can ever remove it. Capped at the RFC maximum of 320 characters.
+Rate limiting is still absent and is listed below as a known limitation.
+
+---
+
 ## Known, accepted limitations
 
 Stated plainly rather than left to be discovered.
@@ -417,9 +569,17 @@ Stated plainly rather than left to be discovered.
 6. **`APP_ORIGIN` must be set in production.** CSRF and Next's Server Action origin
    check both compare against it. If it is unset, every mutation fails closed —
    deliberately, since the alternative is trusting a client-supplied header.
-7. **The CSRF token is signed but not bound to a session id.** It is rotated at
-   sign-in and cleared at sign-out, which closes fixation across a session boundary,
-   but a token is not cryptographically tied to the user holding it.
-8. **`app.write_audit` accepts a caller-supplied action string.** A trusted
+7. **`app.write_audit` accepts a caller-supplied action string.** A trusted
    server-side caller could record an action that did not happen. Only `service_role`
-   can reach it, so this is a compromised-server scenario, not a tenant one.
+   can reach it, so this is a compromised-server scenario, not a tenant one — but
+   note `metadata.actor_source` will read `caller`, not `jwt`, for every such row.
+8. **There is no rate limiting anywhere.** `signInAction` in particular can be
+   called repeatedly by an unauthenticated caller, and each failure appends a row to
+   a table that by design can never be pruned. The email is capped at 320 characters
+   so the growth is bounded per attempt, but not in total.
+9. **There is no retention or erasure path for audit_log.** Append-only is enforced
+   against every role, which is the point — and it means a GDPR erasure request
+   touching the failed-login rows cannot currently be honoured.
+10. **`TRUSTED_PROXY_COUNT` must match the deployment.** The audit IP is read that
+   many entries from the end of `X-Forwarded-For`. Set it wrong and the recorded
+   address is wrong — silently.

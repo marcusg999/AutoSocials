@@ -70,6 +70,29 @@ begin
   end loop;
 end $$;
 
+-- Authorship is set once, at insert, and never changes. The column is already
+-- outside the UPDATE grant; this makes it true for every role, including a worker
+-- or a migration running as the owner, and keeps the audit trail honest -- the
+-- audit row records WHICH columns changed but never their old values, so a
+-- silently reassigned author would be unrecoverable.
+create or replace function app.pin_post_authorship()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+begin
+  new.created_by := old.created_by;
+  return new;
+end;
+$$;
+
+drop trigger if exists posts_keep_author on public.posts;
+create trigger posts_keep_author
+  before update on public.posts
+  for each row execute function app.pin_post_authorship();
+
+revoke all on function app.pin_post_authorship() from public;
+
 -- Every function in schema `app` is revoked from PUBLIC. This one especially:
 -- it is SECURITY DEFINER and calls app.write_audit as the owner, so a user who
 -- could execute it could attach it to a table of their own and forge permanent,

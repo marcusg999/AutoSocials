@@ -28,10 +28,9 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
   const nonce = randomBytes(16).toString('base64')
   const csp = contentSecurityPolicy(nonce)
 
-  // Mint the CSRF token before the response exists, so this request's own render
-  // sees the same value the browser is being told to store.
-  const csrf = issueCsrfToken(request)
-
+  // The session is resolved first because the CSRF token is signed over the user
+  // it belongs to, so we cannot mint one until we know who is asking.
+  //
   // Next.js reads the nonce back out of the request's CSP header and stamps it
   // onto its own inline scripts.
   const { response, user, aal } = await updateSession(request, {
@@ -39,6 +38,9 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
     'content-security-policy': csp,
   })
 
+  // Minted onto the REQUEST as well as the response, so this request's own render
+  // embeds the same value the browser is being told to store.
+  const csrf = issueCsrfToken(request, user?.id ?? null)
   if (csrf.isNew) attachCsrfCookie(response, csrf.token)
   applySecurityHeaders(response, csp)
 
@@ -110,10 +112,14 @@ function contentSecurityPolicy(nonce: string): string {
   const supabase = supabaseOrigin()
   const connect = ["'self'", supabase, isProduction() ? null : 'ws:'].filter(Boolean).join(' ')
 
-  // The dev server compiles with eval(); production gets nonce + strict-dynamic
-  // so that no injected <script> can execute even if markup escaping ever fails.
+  // The dev server compiles with eval(); production gets nonce + strict-dynamic so
+  // that no injected <script> can execute even if markup escaping ever fails.
+  //
+  // 'self' is deliberately absent from the production value: 'strict-dynamic' makes
+  // browsers ignore every host and scheme expression, so listing it would only
+  // suggest a protection that is not doing anything.
   const script = isProduction()
-    ? `'self' 'nonce-${nonce}' 'strict-dynamic'`
+    ? `'nonce-${nonce}' 'strict-dynamic'`
     : `'self' 'nonce-${nonce}' 'unsafe-eval' 'unsafe-inline'`
 
   return [
@@ -135,7 +141,12 @@ function contentSecurityPolicy(nonce: string): string {
 
 export const config = {
   matcher: [
-    // Everything except Next's own static output and plain asset files.
-    '/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp|ico|txt|xml|webmanifest)$).*)',
+    // Everything except Next's own build output and the static asset directory.
+    //
+    // Excluded by LOCATION, not by file extension. An extension list quietly
+    // exempts any future route that happens to end in one of them -- an export,
+    // a feed, a sitemap route handler -- leaving it unguarded and without security
+    // headers on the day it is added.
+    '/((?!_next/static|_next/image|favicon\\.ico$).*)',
   ],
 }

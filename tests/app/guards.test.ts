@@ -25,24 +25,78 @@ const actionFiles = appFiles.filter((f) => f.endsWith('.ts') && /['"]use server[
 const pageFiles = appFiles.filter((f) => /\/page\.tsx$/.test(f))
 const routeHandlers = appFiles.filter((f) => /\/route\.ts$/.test(f))
 
-/** Every exported async function in a 'use server' file is a callable server action. */
+/**
+ * Every exported binding in a 'use server' file is a callable server action.
+ *
+ * All three declaration forms are matched. An earlier version recognised only
+ * `export async function`, so `export const x = async () => {}` -- an ordinary
+ * server action -- was invisible to every check in this file, which is precisely
+ * the case it exists to catch.
+ */
+const DECLARATION_FORMS = [
+  /export\s+async\s+function\s+(\w+)/g,          // export async function foo()
+  /export\s+(?:const|let|var)\s+(\w+)\s*=\s*async/g, // export const foo = async ()
+  /export\s+default\s+async\s+function\s+(\w+)/g, // export default async function foo()
+]
+
 function exportedActions(file: string): string[] {
   const source = readFileSync(file, 'utf8')
-  return [...source.matchAll(/export\s+async\s+function\s+(\w+)/g)].map((m) => m[1]!)
+  const names = new Set<string>()
+  for (const pattern of DECLARATION_FORMS) {
+    for (const match of source.matchAll(pattern)) names.add(match[1]!)
+  }
+  return [...names]
 }
 
-/** The body of one exported function, up to the next export. */
+/** Every exported binding at all, however it is declared. Used to prove the
+ *  matchers above did not silently miss one. */
+function everyExportedBinding(file: string): string[] {
+  const source = readFileSync(file, 'utf8')
+  const names = new Set<string>()
+  for (const m of source.matchAll(/export\s+(?:async\s+)?(?:function|const|let|var)\s+(\w+)/g)) {
+    names.add(m[1]!)
+  }
+  for (const m of source.matchAll(/export\s*\{([^}]*)\}/g)) {
+    for (const part of m[1]!.split(',')) {
+      const name = part.trim().split(/\s+as\s+/)[0]?.trim()
+      if (name) names.add(name)
+    }
+  }
+  return [...names]
+}
+
+/**
+ * The body of one exported action, ending at the next export OR at a
+ * non-exported declaration. Stopping only at the next `export` let the last
+ * action in a file absorb trailing private helpers, so an assertCsrf() in a
+ * helper below satisfied the check for an action that never called it.
+ */
 function bodyOf(file: string, name: string): string {
   const source = readFileSync(file, 'utf8')
-  const start = source.indexOf(`export async function ${name}`)
-  const next = source.indexOf('export async function ', start + 1)
-  return source.slice(start, next === -1 ? undefined : next)
+  const start = source.search(new RegExp(`export\\s+(?:default\\s+)?(?:async\\s+function\\s+${name}\\b|(?:const|let|var)\\s+${name}\\b)`))
+  if (start === -1) throw new Error(`could not locate ${name} in ${file}`)
+  const rest = source.slice(start + 1)
+  const nextBoundary = rest.search(/\n(?:export\s|(?:async\s+)?function\s|const\s|let\s|var\s)/)
+  return rest.slice(0, nextBoundary === -1 ? undefined : nextBoundary)
 }
 
 test('there is at least one server action to check, so this test cannot pass vacuously', () => {
   expect(actionFiles.length).toBeGreaterThan(0)
   expect(actionFiles.flatMap(exportedActions).length).toBeGreaterThan(0)
 })
+
+test.each(actionFiles.map((f) => relative(process.cwd(), f)))(
+  '%s — every exported binding is recognised as an action, so none can slip past unchecked',
+  (file) => {
+    // The guard against this whole file quietly under-reporting. If someone
+    // declares an action in a form the matchers do not know, this fails loudly
+    // instead of the action simply never being checked.
+    const full = join(process.cwd(), file)
+    const recognised = exportedActions(full).sort()
+    const allExports = everyExportedBinding(full).sort()
+    expect(recognised, `unrecognised exports in ${file}: ${allExports.filter((n) => !recognised.includes(n)).join(', ')}`)
+      .toEqual(allExports)
+  })
 
 describe('every server action', () => {
   const everyAction = actionFiles.flatMap((file) =>
@@ -99,7 +153,7 @@ describe('every page', () => {
     if (PRE_MFA_PAGES.includes(file)) {
       // These run before aal2 exists by necessity, but must still prove the
       // password step happened and must redirect a verified user away.
-      expect(source).toMatch(/resolveSessionState\(|requireSignedInUser\(/)
+      expect(source).toMatch(/resolveSessionState\(/)
       return
     }
 

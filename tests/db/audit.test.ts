@@ -142,17 +142,30 @@ describe('application-level actions are recorded by our own server, not by the b
     expect(rows[0].ip).toBe('203.0.113.7')
   })
 
-  test('a live JWT always beats the actor our server passes in, so impersonation is impossible', async () => {
-    // p_actor_user_id exists only for the no-session case (a failed login). If a
-    // session IS present, auth.uid() wins -- so the parameter can never be used to
-    // attribute an action to somebody else.
+  test('a conflicting caller-supplied actor is refused outright, not silently overridden', async () => {
+    // p_actor_user_id exists only for the no-session case. When a session IS
+    // present, passing a different actor is a hard error -- silently preferring the
+    // JWT would hide a caller that believed it was attributing the action elsewhere.
+    await asUser(url, ALICE, 'aal2', async (q) => {
+      await q(`set local role postgres`)
+      const err = await expectRejected(() =>
+        q(`select app.write_audit('auth.login', $1, null, null, '{}'::jsonb, null, $2)`,
+          [businessA, MALLORY]))
+      expect(err.message).toMatch(/refusing to attribute/i)
+    })
+  })
+
+  test('every row records whether the actor came from a JWT or from the caller', async () => {
+    // Under a service-role key auth.uid() is null, so the actor is caller-supplied
+    // on every call the app actually makes. Recording that in the row makes it a
+    // visible fact rather than an assumption about a backstop that never fires.
     const rows = await auditRowsFor(async () => {
-      await asUser(url, ALICE, 'aal2', async (q) => {
-        await q(`set local role postgres`)
-        await q(`select app.write_audit('auth.login', $1, null, null, '{}'::jsonb, null, $2)`,
-          [businessA, MALLORY])
+      await asAdmin(url, async (q) => {
+        await q(`select app.write_audit('probe.service', $1, null, null, '{}'::jsonb, null, $2)`,
+          [businessA, ALICE])
       })
     })
+    expect(rows[0].metadata.actor_source).toBe('caller')
     expect(rows[0].actor_user_id).toBe(ALICE)
   })
 })

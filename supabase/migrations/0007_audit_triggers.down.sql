@@ -1,3 +1,5 @@
+drop trigger if exists posts_keep_author on public.posts;
+drop function if exists app.pin_post_authorship();
 -- Reverses 0007_audit_triggers.sql
 do $$
 declare audited_table text;
