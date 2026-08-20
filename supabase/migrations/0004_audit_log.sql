@@ -54,10 +54,13 @@ create trigger audit_log_no_delete
 --
 -- This function is granted to service_role ONLY. It performs no membership or MFA
 -- check of its own, precisely because trusted server-side callers need to log
--- events (a failed login) where there is no session to check. Signed-in users
--- reach it through public.record_audit_event(), which does check. Granting this
--- directly to `authenticated` would hand every user an RLS-bypassing write into
--- any tenant's permanent, undeletable audit trail.
+-- events (a failed login) where there is no session to check.
+--
+-- Signed-in users never reach it. The application writes audit rows from its own
+-- server through the service-role client, which is also the only party that knows
+-- the true client address. Granting this directly to `authenticated` would hand
+-- every user an RLS-bypassing write into any tenant's permanent, undeletable audit
+-- trail.
 create or replace function app.write_audit(
   p_action      text,
   p_business_id uuid    default null,

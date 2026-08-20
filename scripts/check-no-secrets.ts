@@ -9,7 +9,8 @@
  *   npm run test:secrets
  */
 import { execFileSync, spawn } from 'node:child_process'
-import { SCAN_HEADER } from '../lib/security/scan-mode'
+import { createServer } from 'node:http'
+import { SCAN_ACK_HEADER, SCAN_HEADER, scanAcknowledgement } from '../lib/security/scan-mode'
 import { existsSync, readFileSync, readdirSync, statSync, rmSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { join, relative } from 'node:path'
@@ -147,12 +148,14 @@ const ORIGIN = `http://127.0.0.1:${PORT}`
 // Lets the scanner render authenticated pages. Generated fresh for each run and
 // never written anywhere. See lib/security/scan-mode.ts for the fences.
 const SCAN_TOKEN = randomBytes(32).toString('hex')
+const STUB_PORT = 3988
 
 function buildEnvironment(): NodeJS.ProcessEnv {
   return {
     ...process.env,
     ...CANARIES,
-    NEXT_PUBLIC_SUPABASE_URL: process.env.NEXT_PUBLIC_SUPABASE_URL ?? 'https://example.supabase.co',
+    // Pointed at the local stub so authenticated pages actually render.
+    NEXT_PUBLIC_SUPABASE_URL: `http://127.0.0.1:${STUB_PORT}`,
     NEXT_PUBLIC_SUPABASE_ANON_KEY: process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? 'public-anon-key-safe-to-ship',
     APP_ORIGIN: ORIGIN,
     SECRET_SCAN_TOKEN: SCAN_TOKEN,
@@ -160,23 +163,61 @@ function buildEnvironment(): NodeJS.ProcessEnv {
   }
 }
 
-/** Every route the app serves, read from Next's own manifest. */
+/**
+ * Every route the app serves, read from Next's own manifest.
+ *
+ * Dynamic segments are FILLED IN, not skipped. Skipping them meant a page at
+ * `/dashboard/[businessId]` was never fetched and never even named in the output --
+ * and Phase 2 is almost entirely dynamic segments, so the blind spot pointed
+ * directly at the routes that do not exist yet. A placeholder that 404s is a fine
+ * outcome; a route nobody looked at is not.
+ */
 function routesFromManifest(): string[] {
   const manifestPath = join(ROOT, '.next/server/app-paths-manifest.json')
   if (!existsSync(manifestPath)) return []
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, string>
   const routes = new Set<string>()
   for (const key of Object.keys(manifest)) {
-    const route = key.replace(/\/(page|route)$/, '')
-    // Skip Next's internal error pages and any dynamic segment we cannot fill in.
+    let route = key.replace(/\/(page|route)$/, '')
     if (route.startsWith('/_')) continue
-    if (route.includes('[')) continue
+
+    // [...slug] and [[...slug]] take several segments; [id] takes one.
+    route = route
+      .replace(/\[\[?\.\.\.[^\]]+\]\]?/g, 'aaaaaaaa-0000-4000-8000-000000000000/second')
+      .replace(/\[[^\]]+\]/g, 'aaaaaaaa-0000-4000-8000-000000000000')
+
     routes.add(route === '' ? '/' : route)
   }
   return [...routes]
 }
 
-type Fetched = { text: string; status: number }
+/**
+ * A stand-in for the Supabase REST and Auth endpoints.
+ *
+ * Without it the dashboard cannot render at all, so the four routes that actually
+ * display tenant data were excluded from the scan -- leaving it covering `/login`
+ * and three "Coming in a later phase" placeholders while reporting a clean bill of
+ * health. It returns empty result sets, which is all a leak check needs: the
+ * question is whether the SERVER's own secrets reach the browser, not what the rows
+ * contain.
+ */
+function startSupabaseStub(port: number) {
+  const server = createServer((req, res) => {
+    const url = req.url ?? '/'
+    res.setHeader('content-type', 'application/json')
+    if (url.startsWith('/auth/v1/user')) {
+      res.writeHead(401)
+      res.end(JSON.stringify({ message: 'no session' }))
+      return
+    }
+    res.writeHead(200)
+    res.end(url.startsWith('/rest/v1/') ? '[]' : '{}')
+  })
+  server.listen(port, '127.0.0.1')
+  return server
+}
+
+type Fetched = { text: string; status: number; finalPath: string }
 
 async function fetchDocument(url: string, extra: Record<string, string> = {}): Promise<Fetched> {
   try {
@@ -190,22 +231,47 @@ async function fetchDocument(url: string, extra: Record<string, string> = {}): P
     const body = await response.text()
     // Header values count too: a secret in a Set-Cookie or a custom header ships.
     const headerText = [...response.headers.entries()].map(([k, v]) => `${k}: ${v}`).join('\n')
-    return { text: `${headerText}\n${body}`, status: response.status }
+    let finalPath = new URL(url).pathname
+    try { finalPath = new URL(response.url).pathname } catch { /* keep the request path */ }
+    return { text: `${headerText}\n${body}`, status: response.status, finalPath }
   } catch {
-    return { text: '', status: 0 }
+    return { text: '', status: 0, finalPath: '' }
   }
 }
 
-async function waitForServer(): Promise<boolean> {
+/**
+ * Waits for OUR server, and proves it is ours.
+ *
+ * Waiting for "something answers on the port" is not enough. With an unrelated
+ * process holding the port, the scan happily read a 40-byte dummy page eight times
+ * and reported "16 served responses scanned" -- a higher number than the honest
+ * run -- and exited 0. The acknowledgement header can only be produced by something
+ * that knows this run's token.
+ */
+async function waitForOurServer(): Promise<string | null> {
+  // Computed with THIS run's token; the scanner's own env does not carry it.
+  const expected = scanAcknowledgement(SCAN_TOKEN)
   for (let attempt = 0; attempt < 60; attempt++) {
     try {
-      await fetch(`${ORIGIN}/login`, { redirect: 'manual' })
-      return true
+      const response = await fetch(`${ORIGIN}/login`, {
+        headers: { [SCAN_HEADER]: SCAN_TOKEN },
+        redirect: 'manual',
+      })
+      const ack = response.headers.get(SCAN_ACK_HEADER)
+      if (ack === expected) return null
+      if (ack) return `the server on port ${PORT} answered with the wrong acknowledgement`
+      // Something is on the port but it is not this build. Keep waiting briefly in
+      // case ours is still starting, then say so plainly.
+      if (attempt > 10) {
+        return `something other than this build is serving port ${PORT} `
+          + '(no scan acknowledgement) — the scan would have measured the wrong server'
+      }
     } catch {
-      await new Promise((resolve) => setTimeout(resolve, 500))
+      // Nothing listening yet.
     }
+    await new Promise((resolve) => setTimeout(resolve, 500))
   }
-  return false
+  return `the app did not start on port ${PORT} within 30s`
 }
 
 async function checkServedResponses() {
@@ -225,41 +291,59 @@ async function checkServedResponses() {
   }
 
   console.log(`  serving the app and reading ${routes.length} route(s) as a browser would...`)
-  const server = spawn('npx', ['next', 'start', '-p', String(PORT)], {
-    cwd: ROOT, env: buildEnvironment(), stdio: 'ignore', detached: true,
+  const stub = startSupabaseStub(STUB_PORT)
+
+  // Bound to loopback: this server runs with the scan bypass live and must not be
+  // reachable from the network.
+  const server = spawn('npx', ['next', 'start', '-p', String(PORT), '-H', '127.0.0.1'], {
+    cwd: ROOT, env: buildEnvironment(), stdio: ['ignore', 'ignore', 'pipe'], detached: true,
   })
+  let serverStderr = ''
+  server.stderr?.on('data', (chunk) => { serverStderr += String(chunk) })
+  let serverExited = false
+  server.on('exit', () => { serverExited = true })
 
   const found: string[] = []
   let scanned = 0
   try {
-    if (!(await waitForServer())) {
-      fail('the app did not start, so no served response could be scanned')
+    const startupProblem = await waitForOurServer()
+    if (startupProblem) {
+      fail(`${startupProblem}${serverExited ? `\n    next start exited early:\n${serverStderr.trim()}` : ''}`)
       return
     }
 
-    // Routes that cannot render without a live Supabase project: the dashboard
-    // lists the businesses RLS lets you see, and '/' and the MFA pages all send a
-    // verified session on to it. Listed explicitly, reported in the output, and NOT
-    // counted as scanned -- an environment limitation stated out loud rather than a
-    // silent gap. Against a real project this list should be empty.
-    const NEEDS_LIVE_DATABASE = ['/dashboard', '/', '/mfa/enroll', '/mfa/verify']
+    // There is no allowlist. Every route must render and be inspected, or the scan
+    // fails. An earlier version excused four routes to a console note -- and those
+    // four were the only ones that render tenant data, so the scan covered `/login`
+    // and three placeholders while reporting success.
     const notRendered: string[] = []
-    const unverifiable: string[] = []
+    const redirected: string[] = []
 
     for (const route of routes) {
+      // The HTML first. If it redirects somewhere that is scanned on its own turn,
+      // the whole route is covered and there is nothing more to fetch for it.
+      const html = await fetchDocument(`${ORIGIN}${route}`)
+      if (html.status === 200 && html.finalPath !== route && routes.includes(html.finalPath)) {
+        redirected.push(`${route} → ${html.finalPath}, which is scanned separately`)
+        continue
+      }
+
       const documents: Array<[string, Fetched]> = [
-        [`${route} (HTML)`, await fetchDocument(`${ORIGIN}${route}`)],
+        [`${route} (HTML)`, html],
         // The RSC flight payload: what a client-side navigation receives, and where
         // a server-to-client prop actually lands.
         [`${route} (RSC flight)`, await fetchDocument(`${ORIGIN}${route}`, { RSC: '1' })],
       ]
+
       for (const [label, doc] of documents) {
-        // A redirect body is a handful of bytes and proves nothing. Counting one as
-        // "scanned" is how this check previously reported 16 responses while
-        // actually inspecting a single page.
         if (doc.status !== 200) {
-          if (NEEDS_LIVE_DATABASE.includes(route)) unverifiable.push(`${label} returned ${doc.status}`)
-          else notRendered.push(`${label} returned ${doc.status}`)
+          notRendered.push(`${label} returned ${doc.status}`)
+          continue
+        }
+        // A 200 that is Next's error boundary proves nothing, so it must not be
+        // counted as coverage either.
+        if (/__next_error__|"digest":"NEXT_/.test(doc.text)) {
+          notRendered.push(`${label} rendered an error boundary`)
           continue
         }
         scanned++
@@ -270,18 +354,17 @@ async function checkServedResponses() {
       }
     }
 
-    // Coverage is part of the result. If scan mode ever stops working, every route
-    // becomes a redirect again and this fails loudly rather than passing vacuously.
+    if (redirected.length) {
+      console.log(`  NOTE  ${redirected.length} response(s) redirect to a route scanned on its own turn`)
+    }
     if (notRendered.length) {
       fail(`these responses could not be inspected, so the scan is incomplete:\n    `
         + notRendered.join('\n    '))
     }
-    if (unverifiable.length) {
-      console.log(`  NOTE  ${unverifiable.length} response(s) need a live Supabase project `
-        + `and were NOT scanned:\n    ${unverifiable.join('\n    ')}`)
-    }
+
   } finally {
     try { process.kill(-server.pid!, 'SIGKILL') } catch { /* already gone */ }
+    stub.close()
   }
 
   // The static chunks are still worth checking: a secret inlined at BUILD time

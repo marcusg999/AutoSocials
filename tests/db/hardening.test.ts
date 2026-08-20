@@ -515,35 +515,67 @@ describe('CLASS: only the intended roles can execute anything', () => {
 
 describe('CLASS: every business-scoped table is audited', () => {
   test('any table carrying a business_id has the audit trigger', async () => {
-    // The audited-table list in 0007 is written by hand. A table added by a later
-    // phase would be silently unaudited, and quality bar 4 would quietly stop being
-    // true. This derives the expected set from the schema instead of restating it.
+    // The audited-table list in 0007 is written by hand, so a table added by a later
+    // phase would be silently unaudited and quality bar 4 would quietly stop being
+    // true. This derives the expected set from the schema.
+    //
+    // Business scope is detected by FOREIGN KEY to businesses(id), not by a column
+    // named `business_id`, and across every schema rather than just `public`. Both
+    // narrowings were real holes: a table in schema `app`, or one whose column is
+    // called `tenant_id`, was cross-tenant readable with no audit rows while this
+    // test stayed green.
     await asAdmin(url, async (q) => {
       const r = await q(`
-        select c.relname,
+        select n.nspname || '.' || c.relname as table_name,
                exists (
                  select 1 from pg_trigger t
                  where t.tgrelid = c.oid and not t.tgisinternal and t.tgname = 'audit_changes'
                ) as has_audit_trigger
         from pg_class c
         join pg_namespace n on n.oid = c.relnamespace
-        where n.nspname = 'public' and c.relkind = 'r'
-          -- audit_log carries a business_id but must never be audited: a trigger
+        where n.nspname in ('public', 'app') and c.relkind in ('r', 'p')
+          -- audit_log references businesses but must never be audited: a trigger
           -- writing an audit row for every audit row does not terminate.
-          and c.relname <> 'audit_log'
+          and not (n.nspname = 'public' and c.relname = 'audit_log')
           and (
-            c.relname = 'businesses'
+            (n.nspname = 'public' and c.relname = 'businesses')
             or exists (
-              select 1 from pg_attribute a
-              where a.attrelid = c.oid and a.attname = 'business_id' and not a.attisdropped
+              select 1 from pg_constraint fk
+              where fk.conrelid = c.oid and fk.contype = 'f'
+                and fk.confrelid = 'public.businesses'::regclass
             )
           )
-        order by c.relname`)
+        order by 1`)
 
       expect(r.rowCount, 'no business-scoped tables found — this test would be vacuous')
         .toBeGreaterThan(0)
       for (const table of r.rows) {
-        expect(table.has_audit_trigger, `public.${table.relname} is not audited`).toBe(true)
+        expect(table.has_audit_trigger, `${table.table_name} is not audited`).toBe(true)
+      }
+    })
+  })
+})
+
+describe('CLASS: every table is behind row level security', () => {
+  test('no table anywhere is left without RLS enabled and forced', async () => {
+    // Asserted by exclusion rather than by listing. A hardcoded list of the six
+    // tables that exist today cannot notice a seventh, and a new table without RLS
+    // is readable by every tenant from the moment it is created.
+    await asAdmin(url, async (q) => {
+      const r = await q(`
+        select n.nspname || '.' || c.relname as table_name,
+               c.relrowsecurity, c.relforcerowsecurity
+        from pg_class c join pg_namespace n on n.oid = c.relnamespace
+        where n.nspname in ('public', 'app') and c.relkind in ('r', 'p')
+          -- The migration ledger holds no tenant data and is written before any
+          -- policy could exist.
+          and not (n.nspname = 'public' and c.relname = 'schema_migrations')
+        order by 1`)
+
+      expect(r.rowCount, 'no tables found — this test would be vacuous').toBeGreaterThan(0)
+      for (const table of r.rows) {
+        expect(table.relrowsecurity, `${table.table_name} has no row level security`).toBe(true)
+        expect(table.relforcerowsecurity, `${table.table_name} does not FORCE row level security`).toBe(true)
       }
     })
   })

@@ -21,6 +21,7 @@
 import { timingSafeEqual, createHash } from 'node:crypto'
 
 export const SCAN_HEADER = 'x-postdeck-secret-scan'
+export const SCAN_ACK_HEADER = 'x-postdeck-scan-ack'
 
 function constantTimeEquals(a: string, b: string): boolean {
   const left = createHash('sha256').update(a).digest()
@@ -30,8 +31,16 @@ function constantTimeEquals(a: string, b: string): boolean {
 
 /** Throws if scan mode is switched on somewhere it must never be. */
 function assertScanModeIsSafeHere(token: string): void {
-  const origin = process.env.APP_ORIGIN ?? ''
-  const isLocal = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|$)/.test(origin)
+  // Parse it rather than pattern-matching the raw string. `http://localhost:3000@evil.com`
+  // has hostname `evil.com` -- `localhost:3000` is userinfo -- and a regex anchored on
+  // the scheme happily calls that local.
+  let hostname = ''
+  try {
+    hostname = new URL(process.env.APP_ORIGIN ?? '').hostname
+  } catch {
+    hostname = ''
+  }
+  const isLocal = ['localhost', '127.0.0.1', '::1', '[::1]'].includes(hostname)
   if (!isLocal) {
     throw new Error(
       'SECRET_SCAN_TOKEN is set but APP_ORIGIN is not a local address. '
@@ -51,4 +60,15 @@ export function isSecretScanRequest(headerValue: string | null | undefined): boo
   assertScanModeIsSafeHere(token)
   if (!headerValue) return false
   return constantTimeEquals(token, headerValue)
+}
+
+/**
+ * The value this app answers a scan request with, so the scanner can prove it is
+ * reading the server it just built rather than whatever else holds the port.
+ *
+ * It is derived from the token, so only a process that already knows the token can
+ * produce it -- which means an unrelated server squatting on the port cannot.
+ */
+export function scanAcknowledgement(token = process.env.SECRET_SCAN_TOKEN ?? ''): string {
+  return createHash('sha256').update(`postdeck-scan-ack:${token}`).digest('hex')
 }

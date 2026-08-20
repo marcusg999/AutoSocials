@@ -669,6 +669,127 @@ Excluded with the reason stated, rather than by quietly narrowing the query.
 
 ---
 
+## Gotchas found by the fifth adversarial review
+
+Round 5 answered round 4's sign-off condition — *does the scanner read authenticated
+pages, and does the guard test cover `route.ts`, `.tsx` and `export *`?* — with
+"literally true, materially false". It then got a real service-role key into a
+browser three ways with the scanner exiting 0, and shipped four unguarded server-side
+entry points with the whole suite green.
+
+### G58 — The scanner reported its best-ever coverage while reading a different server
+The worst finding in five rounds, and the third appearance of the same bug wearing
+new clothes. `spawn('next start')`'s exit code was never checked and the readiness
+probe only proved that *something* answered on the port. With an unrelated process
+squatting on 3987:
+
+```
+$ node squat.mjs &          # 40-byte dummy server
+$ npx tsx scripts/check-no-secrets.ts
+  PASS  no server-only secret appears in any of 16 served responses or 12 static chunks
+All 8 secret-handling checks passed.        EXIT=0
+```
+
+**Sixteen responses "scanned" — more than the honest run's twelve — while inspecting
+a 40-byte string sixteen times.** Round 3's note about this file said it "reported 16
+served responses scanned while actually inspecting one page". This is the same
+sentence with *zero* pages.
+
+Fixed with a handshake the scanner cannot be fooled about: the proxy answers a scan
+request with `x-postdeck-scan-ack`, derived from that run's token, so only a process
+holding the token can produce it. The child's stderr and exit code are captured and
+reported. The server binds loopback only.
+
+### G59 — Every dynamic route was skipped, and not even named
+`if (route.includes('[')) continue`. A page at `/dashboard/[businessId]` rendering
+the service-role key returned 200 with the key in the HTML, and the scan reported
+8 routes, 12 responses, all clear. Unlike the excused routes it was not listed
+anywhere in the output.
+
+Phase 2 is almost entirely dynamic segments, so the blind spot was aimed exactly at
+the code that does not exist yet. Segments are now filled with placeholder UUIDs and
+scanned. A placeholder that 404s is a fine outcome; a route nobody looked at is not.
+
+### G60 — The routes that render tenant data were the ones excused
+`NEEDS_LIVE_DATABASE = ['/dashboard', '/', '/mfa/enroll', '/mfa/verify']` sent
+unscannable routes to `console.log` rather than `fail()`. Those four were the only
+routes that render anything; the remaining coverage was `/login` and three pages
+whose entire content is "Coming in a later phase." A leak planted on `/dashboard`
+passed.
+
+The allowlist is gone. Any route that cannot be inspected now fails the scan. To
+make that achievable, the scanner starts a small stand-in for the Supabase REST and
+Auth endpoints so authenticated pages actually render — the question a leak check
+asks is whether the *server's own* secrets reach the browser, not what the rows
+contain. A 200 that is really Next's error boundary is no longer counted either.
+
+**An exclusion list on a security check is a list of the places you are not
+checking. Ours had drifted to contain everything that mattered.**
+
+### G61 — Verdict on the scan-mode bypass
+Round 5's judgement was blunt and right: as it stood, a permanent auth-bypass code
+path was being carried in the production bundle to gain coverage of `/login` and
+three placeholder pages. Not worth it.
+
+It is worth it now, because with the Supabase stub it delivers every route with no
+allowlist — which is the only reason to accept it. Its fences were attacked
+individually and all held except one: `isScanModeSafeHere` pattern-matched the raw
+`APP_ORIGIN` string, and `http://localhost:3000@evil.com` has hostname `evil.com`
+(`localhost:3000` is userinfo). It now parses the URL and compares `.hostname`, the
+way `csrf.ts` already did.
+
+Every production-shaped misconfiguration fails **closed** — a throw inside `proxy()`
+is a 500 on every request, not an open door — and the header appears in zero client
+chunks.
+
+### G62 — `'use server'` is legal anywhere, and the guard test walked two directories
+`walk('app').concat(walk('lib'))`. An unguarded action in `components/danger.ts` was
+invisible; the suite stayed green. It now walks the project root minus
+`node_modules`, `.next`, `tests`, `supabase` and `scripts`.
+
+### G63 — An anonymous default export hides everything declared inside it
+`export default async function () {` binds no name, so the "recognised actions" and
+"all exports" sets were **both empty** and the equality guard added in round 4 was
+satisfied by two empty lists. An inline `'use server'` action inside such a
+component — no CSRF, no session check, deleting businesses — passed 39/39.
+
+The save was thinner than that: with `export const dynamic = 'force-dynamic'`
+present the equality guard happened to fire on `dynamic`, an unrelated line. Remove
+one line and it went green. **A test held up by a coincidence is not held up.**
+
+Anonymous default exports are now banned outright, and inline `'use server'` blocks
+are found and checked where they are declared.
+
+### G64 — `export const POST = async` is not `export async function POST`
+The route-handler CSRF requirement was keyed on the second form, so the first
+matched nothing, `methods` came back empty, and the requirement never applied.
+Both forms are matched now — and each method is checked against **its own body**,
+because the previous file-wide match let a guarded `GET` vouch for an unguarded
+`POST` sitting beside it.
+
+### G65 — Two class tests that could not see a new table
+- The audit-trigger test filtered `nspname = 'public'` and detected business scope
+  by a column literally named `business_id`. A table in schema `app`, or one whose
+  column is `tenant_id`, was cross-tenant readable and writable with zero audit rows
+  while the suite stayed green. Scope is now detected by **foreign key to
+  `businesses(id)`** across both schemas.
+- The "RLS enabled and forced" test asserted against a hardcoded list of six tables
+  and `expect(rowCount).toBe(6)` — it cannot notice a seventh, by construction. It is
+  now asserted by exclusion: every table in `public` and `app`, except the migration
+  ledger, must have RLS enabled and forced.
+
+**A check that enumerates what exists cannot catch what gets added. Assert by
+exclusion.**
+
+### G66 — A rollback that did the opposite of its own comment
+`0010_lock_down_functions.down.sql` opened with
+`alter default privileges grant execute on functions to public;` directly above a
+comment reading *"It does NOT restore PUBLIC execute: that was never wanted."*
+Measured after `down`, a newly created function was PUBLIC- and anon-executable.
+Undoing a lockdown should never mean unlocking.
+
+---
+
 ## Known, accepted limitations
 
 Stated plainly rather than left to be discovered.
@@ -705,9 +826,10 @@ Stated plainly rather than left to be discovered.
    refuses to run unless `APP_ORIGIN` is a local address, and is deliberately absent
    from `.env.example`. The scanner asserts all four fences. It is still a bypass,
    and it is the single thing in this codebase most worth re-reading before deploy.
-9. **The secret scan cannot render four routes** without a live Supabase project
-   (`/dashboard` and the three that redirect to it). They are named in the output as
-   unscanned rather than counted. Against a real project that list should be empty.
+9. **The secret scan renders against a stand-in for Supabase**, not the real thing.
+   Every route is inspected and there is no exclusion list, but the rows are empty
+   and the auth endpoint returns 401. It answers "do the server's own secrets reach
+   the browser", not "is the data correct".
 10. **There is no rate limiting anywhere.** `signInAction` in particular can be
    called repeatedly by an unauthenticated caller, and each failure appends a row to
    a table that by design can never be pruned. The email is capped at 320 characters

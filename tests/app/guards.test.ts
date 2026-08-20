@@ -20,7 +20,26 @@ function walk(dir: string, out: string[] = []): string[] {
   return out
 }
 
-const appFiles = walk('app').concat(walk('lib'))
+/**
+ * The whole project, not just app/ and lib/.
+ *
+ * A `'use server'` module is legal anywhere under the project root -- `components/`,
+ * `server/`, `src/` are all idiomatic -- and walking two directories meant an
+ * unguarded action a directory over was invisible to every check in this file.
+ */
+const SKIP_DIRECTORIES = new Set(['node_modules', '.next', '.git', 'tests', 'supabase', 'scripts'])
+
+function walkProject(dir = '.', out: string[] = []): string[] {
+  for (const entry of readdirSync(dir)) {
+    if (SKIP_DIRECTORIES.has(entry)) continue
+    const full = join(dir, entry)
+    if (statSync(full).isDirectory()) walkProject(full, out)
+    else out.push(full)
+  }
+  return out
+}
+
+const appFiles = walkProject()
 
 /**
  * A 'use server' module can be .ts OR .tsx -- an actions file colocated with a
@@ -30,8 +49,14 @@ const appFiles = walk('app').concat(walk('lib'))
 const actionFiles = appFiles.filter(
   (f) => /\.tsx?$/.test(f) && /['"]use server['"]/.test(readFileSync(f, 'utf8')),
 )
-const pageFiles = appFiles.filter((f) => /\/page\.tsx$/.test(f))
+// Every file convention Next will render as, or on behalf of, a route. A guard on
+// page.tsx alone leaves default.tsx (parallel-route slots), opengraph-image.tsx and
+// the metadata routes rendering with nothing but the proxy in front of them.
+const pageFiles = appFiles.filter((f) => /\/(page|default)\.tsx$/.test(f))
 const layoutFiles = appFiles.filter((f) => /\/(layout|template)\.tsx$/.test(f))
+const metadataRoutes = appFiles.filter(
+  (f) => /\/(opengraph-image|twitter-image|icon|apple-icon|sitemap|robots|not-found)\.tsx?$/.test(f),
+)
 const routeHandlers = appFiles.filter((f) => /\/route\.tsx?$/.test(f))
 
 /** Source with comments removed, so a commented-out guard cannot satisfy a match. */
@@ -95,6 +120,36 @@ function bodyOf(file: string, name: string): string {
   const nextBoundary = rest.search(/\n(?:export\s|(?:async\s+)?function\s|const\s|let\s|var\s)/)
   return rest.slice(0, nextBoundary === -1 ? undefined : nextBoundary)
 }
+
+test.each(appFiles.filter((f) => /\.tsx?$/.test(f)).map((f) => relative(process.cwd(), f)))(
+  '%s — has no anonymous default export, which would hide anything declared inside it',
+  (file) => {
+    // `export default async function () {` binds no name, so both the
+    // "recognised actions" and "all exports" matchers return nothing and the
+    // equality guard below is satisfied by two empty lists. An inline
+    // `'use server'` action inside such a component is then never examined.
+    expect(code(join(process.cwd(), file)), `${file} default-exports an anonymous function`)
+      .not.toMatch(/export\s+default\s+(async\s+)?function\s*\(/)
+  })
+
+test.each(appFiles.filter((f) => /\.tsx?$/.test(f)).map((f) => relative(process.cwd(), f)))(
+  '%s — any inline server action is guarded where it is declared',
+  (file) => {
+    // An action can be declared inside a component body with its own 'use server'
+    // directive. It is a real, callable entry point and belongs to no exported
+    // binding, so it is checked here by its enclosing declaration.
+    const source = code(join(process.cwd(), file))
+    const inlineActions = [...source.matchAll(
+      /(?:async\s+function\s+(\w+)|const\s+(\w+)\s*=\s*async)[^{]*\{\s*['"]use server['"]/g,
+    )]
+    for (const match of inlineActions) {
+      const name = match[1] ?? match[2]
+      const body = source.slice(match.index!, source.indexOf('\n  }', match.index!) + 4)
+      expect(body, `inline action ${name} in ${file} does not check CSRF`).toMatch(/assertCsrf\(/)
+      expect(body, `inline action ${name} in ${file} does not establish a session`)
+        .toMatch(/require(MfaSession|SignedInUser)OrThrow\(/)
+    }
+  })
 
 test('there is at least one server action to check, so this test cannot pass vacuously', () => {
   expect(actionFiles.length).toBeGreaterThan(0)
@@ -209,16 +264,47 @@ describe('every route handler', () => {
     for (const file of routeHandlers) {
       const relPath = relative(process.cwd(), file)
       const source = code(file)
-      const methods = [...source.matchAll(/export\s+async\s+function\s+(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)/g)]
-        .map((m) => m[1]!)
+      // Both declaration forms. `export const POST = async () => {}` is ordinary and
+      // matching only `export async function POST` meant the CSRF requirement below
+      // simply never applied to it.
+      const methodPattern =
+        /export\s+(?:async\s+function\s+|const\s+)(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\b/g
+      const methods = [...source.matchAll(methodPattern)].map((m) => ({
+        name: m[1]!,
+        // Each method is checked on its OWN body: a file-wide match let a guarded
+        // GET vouch for an unguarded POST sitting beside it.
+        body: (() => {
+          const from = m.index!
+          const rest = source.slice(from + 1)
+          const next = rest.search(methodPattern)
+          return rest.slice(0, next === -1 ? undefined : next)
+        })(),
+      }))
 
-      expect(source, `${relPath} does not establish a session`).toMatch(/requireMfaSession(OrThrow)?\(/)
+      expect(methods.length, `${relPath} exports no recognised HTTP method`).toBeGreaterThan(0)
 
-      if (methods.some((m) => MUTATING.includes(m))) {
-        expect(source, `${relPath} mutates without a CSRF check`).toMatch(/assertCsrf\(/)
+      for (const method of methods) {
+        expect(method.body, `${relPath} ${method.name} does not establish a session`)
+          .toMatch(/requireMfaSession(OrThrow)?\(/)
+        if (MUTATING.includes(method.name)) {
+          expect(method.body, `${relPath} ${method.name} mutates without a CSRF check`)
+            .toMatch(/assertCsrf\(/)
+        }
       }
     }
   })
+})
+
+test('no metadata route renders tenant data without establishing a session', () => {
+  // opengraph-image.tsx and friends are real routes, and the image ones are exactly
+  // the sort of response a CDN will cache.
+  for (const file of metadataRoutes) {
+    const source = code(file)
+    if (/\.from\(|\.rpc\(/.test(source)) {
+      expect(source, `${relative(process.cwd(), file)} queries the database without a session guard`)
+        .toMatch(/requireMfaSession\(/)
+    }
+  }
 })
 
 test('no layout or template renders tenant data without establishing a session', () => {

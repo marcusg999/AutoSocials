@@ -23,7 +23,7 @@ import {
   isPublicPath,
 } from '@/lib/security/routes'
 import { isProduction, supabaseOrigin } from '@/lib/env'
-import { SCAN_HEADER, isSecretScanRequest } from '@/lib/security/scan-mode'
+import { SCAN_ACK_HEADER, SCAN_HEADER, isSecretScanRequest, scanAcknowledgement } from '@/lib/security/scan-mode'
 
 export async function proxy(request: NextRequest): Promise<NextResponse> {
   const nonce = randomBytes(16).toString('base64')
@@ -46,8 +46,13 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
   applySecurityHeaders(response, csp)
 
   // The secret scanner needs pages to actually render so it can read them. See
-  // lib/security/scan-mode.ts for the four fences around this.
-  if (isSecretScanRequest(request.headers.get(SCAN_HEADER))) return response
+  // lib/security/scan-mode.ts for the fences around this. The acknowledgement lets
+  // the scanner prove it is reading this build and not some other process that
+  // happens to hold the port.
+  if (isSecretScanRequest(request.headers.get(SCAN_HEADER))) {
+    response.headers.set(SCAN_ACK_HEADER, scanAcknowledgement())
+    return response
+  }
 
   const { pathname } = request.nextUrl
   const target = destinationFor(pathname, user !== null, aal?.currentLevel ?? null, aal?.nextLevel ?? null)
