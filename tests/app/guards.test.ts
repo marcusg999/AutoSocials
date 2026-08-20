@@ -8,7 +8,7 @@
  * hand-written per-route test can catch.
  */
 import { describe, expect, test } from 'vitest'
-import { readFileSync, readdirSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { join, relative } from 'node:path'
 
 function walk(dir: string, out: string[] = []): string[] {
@@ -47,12 +47,15 @@ const SOURCE = /\.(m|c)?[jt]sx?$/
 const appFiles = walkProject()
 
 /**
- * A 'use server' module can be .ts OR .tsx -- an actions file colocated with a
- * component, or inline actions inside one, are both idiomatic Next. Filtering to
- * .ts alone made every .tsx action invisible to this whole file.
+ * A 'use server' module can be any extension Next compiles, so this uses SOURCE.
+ *
+ * It read /\.tsx?$/ while every other collector in this file read SOURCE. The same
+ * action, byte for byte, was checked as danger.ts and completely unchecked as
+ * danger.js -- registered in the server-reference manifest and callable -- and
+ * tsconfig's `allowJs: false` meant typecheck could not see it either.
  */
 const actionFiles = appFiles.filter(
-  (f) => /\.tsx?$/.test(f) && /['"]use server['"]/.test(readFileSync(f, 'utf8')),
+  (f) => SOURCE.test(f) && /['"]use server['"]/.test(readFileSync(f, 'utf8')),
 )
 // Every file convention Next will render as, or on behalf of, a route. A guard on
 // page.tsx alone leaves default.tsx (parallel-route slots), opengraph-image.tsx and
@@ -126,15 +129,39 @@ function bodyOf(file: string, name: string): string {
   return rest.slice(0, nextBoundary === -1 ? undefined : nextBoundary)
 }
 
-test.each(appFiles.filter((f) => SOURCE.test(f)).map((f) => relative(process.cwd(), f)))(
+/**
+ * Everything Next compiles as application code: every file under app/, plus every
+ * 'use server' module wherever it lives. Build configuration (next.config.ts,
+ * vitest.config.mts) is neither served nor a place an action can hide, and an
+ * anonymous default export is the normal way to write one.
+ */
+const COMPILED_AS_APP = appFiles.filter(
+  (f) => SOURCE.test(f) && (f.startsWith('app/') || actionFiles.includes(f)),
+)
+
+test.each(COMPILED_AS_APP.map((f) => relative(process.cwd(), f)))(
   '%s — has no anonymous default export, which would hide anything declared inside it',
   (file) => {
     // `export default async function () {` binds no name, so both the
     // "recognised actions" and "all exports" matchers return nothing and the
     // equality guard below is satisfied by two empty lists. An inline
     // `'use server'` action inside such a component is then never examined.
-    expect(code(join(process.cwd(), file)), `${file} default-exports an anonymous function`)
-      .not.toMatch(/export\s+default\s+(async\s+)?function\s*\(/)
+    //
+    // An arrow binds no name either, and banning only the `function` form left
+    // `export default async (formData) => {}` -- a real, registered server action
+    // doing a service-role delete with no CSRF and no session check -- invisible to
+    // every check in this file. So the rule is that a default export must be a
+    // NAMED declaration or a bare identifier, whatever syntax produced it.
+    const source = code(join(process.cwd(), file))
+    const defaultExport = source.match(/export\s+default\s+([\s\S]{0,40})/)
+    if (!defaultExport) return
+    const tail = defaultExport[1]!
+    const isNamed =
+      /^\s*(async\s+)?function\s+\w/.test(tail)   // export default function foo()
+      || /^\s*(async\s+)?class\s+\w/.test(tail)   // export default class Foo
+      || /^\s*\w+\s*(;|$|\n)/.test(tail)          // export default foo
+    expect(isNamed, `${file} default-exports something anonymous (\`export default ${tail.trim().slice(0, 30)}\`); `
+      + 'name it, or nothing in this file can see what it contains').toBe(true)
   })
 
 test.each(appFiles.filter((f) => SOURCE.test(f)).map((f) => relative(process.cwd(), f)))(
@@ -164,7 +191,7 @@ describe('the enumeration this file performs is the complete one', () => {
   // walking an unguarded route.
   test('every routable file on disk is picked up by one of the collectors', () => {
     const ROUTE_CONVENTIONS =
-      /\/(page|layout|template|default|route|loading|error|global-error|not-found|opengraph-image|twitter-image|icon|apple-icon|sitemap|robots)\.(m|c)?[jt]sx?$/
+      /\/(page|layout|template|default|route|loading|error|global-error|not-found|opengraph-image|twitter-image|icon|apple-icon|sitemap|robots|manifest)\.(m|c)?[jt]sx?$/
     const routable = appFiles.filter((f) => f.startsWith('app/') && ROUTE_CONVENTIONS.test(f))
     const collected = new Set([...pageFiles, ...layoutFiles, ...metadataRoutes, ...routeHandlers])
 
@@ -175,6 +202,37 @@ describe('the enumeration this file performs is the complete one', () => {
       if (NO_DATA_CONVENTIONS.test(file)) continue
       expect([...collected], `${relative(process.cwd(), file)} is a real route but no collector in `
         + 'this file picks it up, so nothing checks its guards').toContain(file)
+    }
+  })
+
+  test('the pages/ router is not used, because nothing here can see it', () => {
+    // Every collector in this file, the proxy's route conventions, and the secret
+    // scanner's route table all describe the APP router. A `pages/api/*.ts` file is
+    // a real, registered endpoint that none of them models: one serving the
+    // service-role key answered an anonymous GET with 200, no security headers and
+    // no guard, while the whole suite and the secret scan stayed green.
+    //
+    // This project is App Router only, so the honest rule is that the other router
+    // must not exist. If a later phase needs it, this test is where the guards for
+    // it get written -- deleting the test is not the same as adding them.
+    const pagesDirs = ['pages', 'src/pages'].filter((dir) => existsSync(dir))
+    expect(pagesDirs, 'the pages/ router is invisible to every guard in this file and to '
+      + 'scripts/check-no-secrets.ts; guard it there before adding it').toEqual([])
+  })
+
+  test('every file that could hide an action is checked for anonymous default exports', () => {
+    // COMPILED_AS_APP narrows to app/ plus 'use server' modules, and a narrowing is
+    // exactly what six review rounds kept finding. The claim is checkable: a server
+    // action requires the 'use server' directive somewhere in its file, so a file
+    // carrying that directive is in actionFiles by construction. This asserts it
+    // rather than leaving it to be re-derived.
+    for (const file of actionFiles) {
+      expect(COMPILED_AS_APP, `${relative(process.cwd(), file)} declares 'use server' but is not `
+        + 'checked for anonymous default exports').toContain(file)
+    }
+    for (const file of appFiles.filter((f) => SOURCE.test(f) && f.startsWith('app/'))) {
+      expect(COMPILED_AS_APP, `${relative(process.cwd(), file)} is app code but is not checked`)
+        .toContain(file)
     }
   })
 
@@ -190,6 +248,13 @@ describe('the enumeration this file performs is the complete one', () => {
       expect(MEDIA.test(urlPath), `${relative(process.cwd(), file)} is served at ${urlPath}, which `
         + 'the proxy matcher excludes — it would be reachable with no auth and no security headers')
         .toBe(false)
+
+      // A catch-all defeats the check from the other side: `app/[...path]/route.ts`
+      // reads as the literal path `/[...path]`, which matches no media extension,
+      // while at runtime it answers `/anything.png` -- which the matcher excludes.
+      // The path cannot be tested, so the shape is banned.
+      expect(/\[\[?\.\.\./.test(urlPath), `${relative(process.cwd(), file)} is a catch-all, so it `
+        + 'serves paths ending in a media extension, which the proxy matcher excludes').toBe(false)
     }
   })
 })
@@ -260,6 +325,17 @@ describe('every server action', () => {
       expect(body, `${name} accepts a password-only session; it needs requireMfaSessionOrThrow`)
         .toMatch(/requireMfaSessionOrThrow\(/)
     }
+  })
+
+  // Quality bar 4: every mutating action writes an audit_log row. The database
+  // triggers cover every ROW change, but an action whose effect is not a row write
+  // -- switchBusinessAction sets a cookie -- leaves no trigger to fire. Nothing
+  // connected server actions to the audit layer at all, so that action could have
+  // shipped unaudited with the whole suite green.
+  test.each(everyAction)('%s → %s() writes an audit_log row', (file, name) => {
+    const body = bodyOf(join(process.cwd(), file), name)
+    expect(body, `${name} mutates without recording an audit_log row`)
+      .toMatch(/recordAudit(OrThrow|AnonymousAudit|Anonymous)?\(/)
   })
 })
 
@@ -372,8 +448,11 @@ test('no route handler exchanges a query parameter for a session', () => {
 })
 
 test('the service-role client is only reachable from server-only modules', () => {
-  const importers = walk('lib').concat(walk('app'))
-    .filter((f) => /\.(ts|tsx)$/.test(f))
+  // Walking lib/ and app/ only, on .ts/.tsx only, meant a 'use client' component in
+  // components/ importing the service-role client was seen by nothing. The action
+  // collector was widened to the project root long before this one was.
+  const importers = appFiles
+    .filter((f) => SOURCE.test(f))
     .filter((f) => /supabase\/admin/.test(readFileSync(f, 'utf8')))
     .filter((f) => !f.endsWith('lib/supabase/admin.ts'))
 

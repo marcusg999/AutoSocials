@@ -52,7 +52,15 @@ create schema if not exists extensions;
 grant usage on schema extensions to authenticated, service_role;
 
 alter default privileges revoke execute on functions from public;
-alter default privileges in schema extensions grant execute on functions to authenticated, service_role;
 
 -- Anything already installed into `extensions` stays callable.
+--
+-- Deliberately an explicit grant over what exists NOW, not a default privilege for
+-- whatever arrives later. A standing `alter default privileges in schema extensions
+-- grant execute on functions to authenticated` would mean a future
+-- `create extension dblink with schema extensions` handed every one of its
+-- functions to every signed-in user automatically -- and because the function class
+-- test exempts extension-owned functions, that grant would also be exempt from the
+-- check by construction. Auto-granted plus auto-exempt is not a combination to
+-- leave armed for a later phase. A new extension now needs a grant someone wrote.
 grant execute on all functions in schema extensions to authenticated, service_role;

@@ -15,13 +15,35 @@
  *   3. isScanModeConfigured() throws at startup if the token is set while APP_ORIGIN
  *      looks like a real deployment, so it cannot be switched on in production by
  *      accident.
- *   4. The scanner asserts every route returned 200; if this path ever stops
- *      working the scan fails loudly instead of quietly measuring redirects again.
+ *   4. The scanner asserts every route rendered a document in at least one scan
+ *      state; if this path ever stops working the scan fails loudly instead of
+ *      quietly measuring redirects again.
  */
 import { timingSafeEqual, createHash } from 'node:crypto'
 
 export const SCAN_HEADER = 'x-postdeck-secret-scan'
 export const SCAN_ACK_HEADER = 'x-postdeck-scan-ack'
+
+/**
+ * Which session state the scanner wants this request answered as.
+ *
+ * Without this the scanner could only ever see the app through a fully verified
+ * session, so /mfa/enroll and /mfa/verify -- which redirect a verified user away --
+ * could not render at all, and three of eight routes were measured as redirects
+ * while the check reported "24 responses scanned". Varying the reported state does
+ * not widen the bypass: the same token and the same local-origin fence gate it.
+ */
+export const SCAN_STATE_HEADER = 'x-postdeck-scan-state'
+
+export type ScanSessionState = 'verified' | 'needs-verification' | 'needs-enrollment'
+
+const SCAN_STATES: ScanSessionState[] = ['verified', 'needs-verification', 'needs-enrollment']
+
+/** The state a scan request asked for, defaulting to a fully verified session. */
+export function secretScanState(headerValue: string | null | undefined): ScanSessionState {
+  const wanted = SCAN_STATES.find((state) => state === headerValue)
+  return wanted ?? 'verified'
+}
 
 function constantTimeEquals(a: string, b: string): boolean {
   const left = createHash('sha256').update(a).digest()

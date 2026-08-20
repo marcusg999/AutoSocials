@@ -7,7 +7,7 @@
  * a known vulnerability has come back.
  */
 import { beforeAll, afterAll, describe, expect, test } from 'vitest'
-import { asAdmin, asAnon, asUser, dropDatabase, expectRejected, freshDatabase } from './helpers'
+import { asAdmin, asAnon, asUser, dropDatabase, expectRejected, freshDatabase, shimOnlyDatabase } from './helpers'
 
 /**
  * Every schema this project is responsible for.
@@ -709,6 +709,106 @@ describe('CLASS: the enumeration each check performs is the complete one', () =>
       // list had grown to swallow something of ours.
       expect(names, 'the public schema is not being scanned').toContain('public')
       expect(names, 'the app schema is not being scanned').toContain('app')
+    })
+  })
+
+  test('our migrations create nothing in a schema the class tests do not scan', async () => {
+    // The assertion above can only notice a schema of ours going MISSING from the
+    // scanned set. It cannot notice one of our objects landing in an EXCLUDED one --
+    // and `storage`, `auth` and `realtime` all exist on a real Supabase project,
+    // with `authenticated` already holding USAGE. A migration creating a
+    // business-scoped table and a non-security_invoker view over public.posts in
+    // `storage` gave a live cross-tenant read and write with the suite at 275/275.
+    //
+    // So the scanned set is no longer a claim: everything our migrations add is
+    // diffed against a database that has the Supabase shim and nothing else, and
+    // every new object must land somewhere the checks above actually look.
+    const INVENTORY = `
+      select n.nspname || '.' || c.relname as name
+      from pg_class c join pg_namespace n on n.oid = c.relnamespace
+      where c.relkind in ('r','p','v','m','f') and n.nspname not like 'pg_%'
+        and n.nspname <> 'information_schema'
+      union all
+      select n.nspname || '.' || p.proname || '()' as name
+      from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+      where n.nspname not like 'pg_%' and n.nspname <> 'information_schema'`
+
+    const baselineUrl = await shimOnlyDatabase('postdeck_baseline')
+    let baseline: Set<string>
+    try {
+      baseline = await asAdmin(baselineUrl, async (q) =>
+        new Set((await q(INVENTORY)).rows.map((r) => r.name as string)))
+    } finally {
+      await dropDatabase('postdeck_baseline')
+    }
+
+    const after = await asAdmin(url, async (q) =>
+      (await q(INVENTORY)).rows.map((r) => r.name as string))
+
+    // The schemas the checks in this file actually read. Kept as a literal list on
+    // purpose: this is the one place where naming them is the POINT, because the
+    // assertion is that nothing of ours lands outside them.
+    const SCANNED = ['public.', 'app.', 'extensions.']
+    const outside = after
+      .filter((name) => !baseline.has(name))
+      .filter((name) => !SCANNED.some((prefix) => name.startsWith(prefix)))
+
+    expect(outside, 'our migrations created these objects in schemas no class test in this '
+      + 'file examines, so nothing checks their RLS, grants or ownership').toEqual([])
+  })
+
+  test('no rewrite RULE redirects a write past the row level security on its target', async () => {
+    // A RULE is not a relkind, so it escapes every check in this file by
+    // construction. `CREATE RULE ... DO INSTEAD INSERT INTO public.posts` runs with
+    // the RULE RELATION's owner's privileges -- the migration superuser -- so RLS on
+    // public.posts is simply not applied. Verified: a member of BETA only had a
+    // direct insert into an ALPHA post rejected, and the identical insert through a
+    // staging table carrying such a rule landed in ALPHA.
+    //
+    // The automatic `_RETURN` rule is how Postgres implements every view; those are
+    // covered by the view checks above. Any OTHER rule is banned, because a rule
+    // cannot be reasoned about from the policies on the table it writes to.
+    await asAdmin(url, async (q) => {
+      const r = await q(`
+        select n.nspname || '.' || c.relname as relation, r.rulename, r.ev_type
+        from pg_rewrite r
+        join pg_class c on c.oid = r.ev_class
+        join pg_namespace n on n.oid = c.relnamespace
+        where ${OUR_SCHEMAS} and not (r.rulename = '_RETURN' and r.ev_type = '1')
+        order by 1, 2`)
+      expect(r.rows, 'these rewrite rules can redirect a statement to another table, where the '
+        + 'policies of the table the caller named no longer apply').toEqual([])
+    })
+  })
+
+  test('every trigger function on our tables is one we reviewed', async () => {
+    // Revoking EXECUTE does not stop a function running. Postgres checks EXECUTE at
+    // CREATE TRIGGER time, not at fire time, so a SECURITY DEFINER function with
+    // EXECUTE revoked from public, anon AND authenticated still runs on every insert
+    // the caller makes. Verified: such a function copied every tenant's posts into a
+    // table the caller could read, while the "only the intended roles can execute
+    // anything" check reported false for all three roles and passed.
+    //
+    // The premise of that check -- a definer helper is safe if nobody can call it --
+    // does not hold for trigger functions, so they are held to a named list instead.
+    // Adding one here is a deliberate act that says someone read what it does.
+    const REVIEWED_TRIGGER_FUNCTIONS = [
+      'app.audit_log_is_append_only',
+      'app.audit_row_change',
+      'app.pin_post_authorship',
+    ]
+    await asAdmin(url, async (q) => {
+      const r = await q(`
+        select distinct fn.nspname || '.' || f.proname as fn
+        from pg_trigger t
+        join pg_class c on c.oid = t.tgrelid
+        join pg_namespace n on n.oid = c.relnamespace
+        join pg_proc f on f.oid = t.tgfoid
+        join pg_namespace fn on fn.oid = f.pronamespace
+        where ${OUR_SCHEMAS} and not t.tgisinternal
+        order by 1`)
+      expect(r.rows.map((x) => x.fn), 'a trigger function runs regardless of who may EXECUTE it, '
+        + 'so each one has to be listed here by someone who read it').toEqual(REVIEWED_TRIGGER_FUNCTIONS)
     })
   })
 })

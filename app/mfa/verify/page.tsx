@@ -27,12 +27,15 @@ export default async function VerifyPage({
   if (state.status === 'verified') redirect(DASHBOARD_PATH)
   if (state.status === 'needs-enrollment') redirect(MFA_ENROLL_PATH)
 
-  const { supabase } = state
   const { error } = await searchParams
   const message = error ? MESSAGES[error] ?? 'Verification could not be completed.' : null
 
-  const { data: factors } = await supabase.auth.mfa.listFactors()
-  const factor = factors?.totp[0]
+  // The factor comes from the user resolveSessionState() already verified, not from
+  // a second listFactors() round trip. The state is `needs-verification` precisely
+  // BECAUSE that user has a verified factor, so asking again re-fetched the same
+  // answer over the network and gave a transient auth error a way to bounce a
+  // legitimate user into re-enrolment.
+  const factor = (state.user.factors ?? []).find((candidate) => candidate.status === 'verified')
   if (!factor) redirect(MFA_ENROLL_PATH)
 
   return (

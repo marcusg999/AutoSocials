@@ -965,6 +965,129 @@ every relation kind present in a schema we own is covered by some check, `public
 and `app` are actually being scanned. The narrowing itself now fails, rather than
 the seventh variant being found by a reviewer walking a row across a tenant boundary.
 
+Round 7 then found four more variants anyway (G80–G86). The correction that mattered
+was not another widened filter: it was noticing that two of the completeness
+assertions were themselves unfalsifiable. *"`public` and `app` are actually being
+scanned"* can only detect a schema of ours going missing from the scanned set — it
+can never detect one of our objects landing in an excluded one. An assertion that
+cannot fail is not evidence. Both were replaced with **diffs against a baseline**
+(G82) rather than claims about a list.
+
+### G80 — Nothing in the project knew the `pages/` router existed
+Every collector in `tests/app/guards.test.ts`, every route convention the proxy
+models, and `routeTable()` in the secret scanner all describe the **App** router.
+A `pages/api/export.png.ts` file is a real, built, registered endpoint that none of
+them saw. Serving the service-role key, it answered an anonymous `GET` with **200,
+no security headers, no guard** — and the secret scan still reported the same
+"8 routes" as a clean tree, because it read only `app-paths-manifest.json`.
+
+This is G74 (a route parked on a media extension the proxy matcher excludes)
+reproduced verbatim, one router over — which is the point: the fix had been written
+against the *instance*, not the class. Now the scanner reads **both** manifests, and
+a test bans the `pages/` router outright with the reason attached, because this
+project is App Router only and deleting the ban is not the same as writing the
+guards.
+
+### G81 — `EXECUTE` is not the only way a function runs, and a `RULE` is not a relkind
+Two live cross-tenant paths, both invisible to every database class test, both at an
+identical 275/275:
+
+- **A rewrite `RULE`.** `CREATE RULE ... DO INSTEAD INSERT INTO public.posts` runs
+  with the *rule relation owner's* privileges — the migration superuser — so RLS on
+  the target is never applied. Verified directly: a member of BETA had a direct
+  insert into an ALPHA post rejected (`new row violates row-level security policy`)
+  and the identical insert through a staging table carrying such a rule returned
+  `INSERT 0 1` and landed in ALPHA. A rule is not a `relkind`, so it escaped the
+  table checks, the view checks and the relkind completeness assertion alike —
+  nothing in the suite read `pg_rewrite` at all.
+- **A `SECURITY DEFINER` trigger function.** Postgres checks `EXECUTE` at
+  `CREATE TRIGGER` time, not at fire time. A definer function with execute revoked
+  from `public`, `anon` **and** `authenticated` — so the "only the intended roles
+  can execute anything" check reported `false` for all three and passed — still ran
+  on every insert the caller made, copying every tenant's posts somewhere readable.
+  The premise of that check, *a definer helper is safe if nobody can call it*, is
+  simply false for trigger functions.
+
+Rules other than the automatic `_RETURN` that backs every view are now banned, and
+trigger functions are held to a reviewed list — a named list is right here, because
+the safety of a definer trigger cannot be derived from privileges at all.
+
+### G82 — An exclusion list is still a list; diff against a baseline instead
+G68's lesson was *"naming the schemas to scan is the same mistake as naming the
+tables"*, and the fix inverted it into `OUR_SCHEMAS` — which excludes `auth`,
+`storage`, `realtime`, `vault` and six more **by name**. On a real Supabase project
+`authenticated` already holds `USAGE` on `storage`, so a business-scoped table and a
+non-`security_invoker` view over `public.posts` created there were reachable and
+invisible to all four class tests.
+
+Worse, the test harness could not even represent the attack: `tests/db/supabase-shim.sql`
+created only `auth`, `vault` and `extensions`, so the exclusion list named schemas
+that **did not exist in a single test**. The exclusion had never been exercised.
+
+Two fixes. The shim now models the schemas a real project ships with. And the
+scanned set is no longer a claim: every object our migrations create is diffed
+against a database carrying the shim and nothing else, and anything landing outside
+`public`, `app` or `extensions` fails.
+
+### G83 — The RSC flight probe read zero flight payloads
+`scripts/check-no-secrets.ts` was rewritten in round 5 specifically to reach the RSC
+flight payload — *"exactly where the old scan could not look"*. It sent the `RSC: 1`
+header. Next requires the `_rsc` **query parameter** too and 307s without it, so all
+eight probes were redirects, every one silently absorbed into the *"redirects to a
+route scanned on its own turn"* note. The channel the whole live-server rewrite
+existed to read was read **zero times**, for two rounds, while the check reported
+success.
+
+And `_rsc` takes **no value**: measured against this build, `RSC: 1` alone gives 307,
+`?_rsc=1` gives 307, `?_rsc` gives 200 and the payload.
+
+The headline number hid it. "24 responses scanned" was true while 14 were redirect
+envelopes, none was a flight payload, and three of eight routes never rendered at
+all — scan mode reports a *verified* session, and `/mfa/enroll` and `/mfa/verify`
+both redirect a verified user away, so they could not render by construction. Scan
+mode now carries a **state**, so the app can be read as each session state it
+supports, and the scan asserts every route rendered a document in at least one of
+them. Volume is not coverage: the scan now prints `9/10 routes rendered, 15 flight
+payloads`.
+
+### G84 — The canary list did not cover the secrets the project declares
+Three names were canaried, one of which (`SUPABASE_DB_PASSWORD`) this project does
+not use. `DATABASE_URL` and `ADMIN_PASSWORD` — both in `.env.example`, both genuinely
+secret — were not. A page printing both shipped the database superuser password and
+the admin password to the browser, and the check named *"no secret appears in the
+client bundle"* passed. The canary set is now checked against `.env.example`: every
+server-only name is canaried or declared non-secret **with a reason**.
+
+### G85 — Two guards were never widened when their siblings were
+G62 widened the action collector to the project root and G73 widened the file regex
+to `/\.(m|c)?[jt]sx?$/`, and in both cases some checks in the same file were left
+behind. `actionFiles` still read `/\.tsx?$/`: the identical file was checked as
+`danger.ts` (5 failures) and completely unchecked as `danger.js` — registered in the
+server-reference manifest, callable, and invisible to `tsc` too because
+`allowJs: false`. The two service-role reachability checks still walked `lib` and
+`app` only. G63's anonymous-default ban still matched only
+`export default function (`, so `export default async () => {}` — a service-role
+delete of every business, no CSRF, no session check — left `DECLARATION_FORMS` and
+`everyExportedBinding` **both empty**, satisfying the equality guard with two empty
+lists, which is the exact coincidence G63 was written to prevent.
+
+### G86 — Nothing connected quality bar 4 to server actions
+Bar 4 says *every mutating action writes an `audit_log` row*. It was proved entirely
+by the six database row triggers — `grep -rn recordAudit tests/app/` returned
+nothing. An action whose effect is not a row write leaves no trigger to fire, and
+`switchBusinessAction` is exactly that shape: it sets a cookie. Every action already
+audited, so the rule needed no exception list; it just was not being enforced.
+
+Two smaller ones from the same round, fixed without incident: `vitest.config.mts`
+collected only `tests/**/*.test.ts`, so a `.test.tsx` file would have sat in the repo
+never running and counted as coverage to anyone reading the directory; and
+`0010_lock_down_functions.sql` carried a standing
+`alter default privileges in schema extensions grant execute on functions to
+authenticated`, which — combined with the function class test exempting
+extension-owned functions — would have made any future `create extension` in that
+schema **auto-granted and auto-exempt** at the same time. Replaced with an explicit
+grant over what exists now.
+
 ---
 
 ## Known, accepted limitations

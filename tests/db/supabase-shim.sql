@@ -26,6 +26,20 @@ do $$ begin create role service_role   nologin bypassrls; exception when duplica
 create schema if not exists auth;
 grant usage on schema auth to anon, authenticated, service_role;
 
+-- The other schemas a real Supabase project ships with.
+--
+-- These existed nowhere in the test harness, so the class tests' schema exclusion
+-- list named schemas that were never present -- meaning the exclusion was never
+-- exercised by a single test. On a real project `authenticated` already holds USAGE
+-- on `storage`, so a business-scoped table created there is reachable, and a
+-- migration that put one there produced a live cross-tenant read while the whole
+-- suite stayed green. Modelled here so that attack can be represented at all.
+create schema if not exists storage;
+create schema if not exists realtime;
+create schema if not exists graphql;
+create schema if not exists graphql_public;
+grant usage on schema storage to anon, authenticated, service_role;
+
 create table if not exists auth.users (
   id    uuid primary key default gen_random_uuid(),
   email text unique

@@ -38,6 +38,30 @@ export async function freshDatabase(dbName: string): Promise<string> {
   return url
 }
 
+/**
+ * A database with the Supabase shim loaded but NONE of our migrations run.
+ *
+ * This is the baseline the class tests diff against. Without it the "which schemas
+ * do we scan" question was answered by a hand-written exclusion list, and a
+ * migration that created a business-scoped table in `storage` -- a schema that
+ * exists on every real Supabase project, and where `authenticated` already holds
+ * USAGE -- was invisible to every check while the suite stayed green.
+ */
+export async function shimOnlyDatabase(dbName: string): Promise<string> {
+  const admin = new Client({ connectionString: ADMIN_URL })
+  await admin.connect()
+  await admin.query(`drop database if exists ${dbName} with (force)`)
+  await admin.query(`create database ${dbName}`)
+  await admin.end()
+
+  const url = urlFor(dbName)
+  const client = new Client({ connectionString: url })
+  await client.connect()
+  await client.query(readFileSync(join(process.cwd(), 'tests/db/supabase-shim.sql'), 'utf8'))
+  await client.end()
+  return url
+}
+
 export async function dropDatabase(dbName: string) {
   const admin = new Client({ connectionString: ADMIN_URL })
   await admin.connect()

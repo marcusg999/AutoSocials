@@ -10,7 +10,7 @@
  */
 import { execFileSync, spawn } from 'node:child_process'
 import { createServer } from 'node:http'
-import { SCAN_ACK_HEADER, SCAN_HEADER, scanAcknowledgement } from '../lib/security/scan-mode'
+import { SCAN_ACK_HEADER, SCAN_HEADER, SCAN_STATE_HEADER, scanAcknowledgement } from '../lib/security/scan-mode'
 import { existsSync, readFileSync, readdirSync, statSync, rmSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { join, relative } from 'node:path'
@@ -68,6 +68,19 @@ function checkGitTracked() {
   else pass('.env.example contains placeholders only')
 }
 
+/** Every source file in the project, excluding build output and dependencies. */
+const SKIP_DIRECTORIES = new Set(['node_modules', '.next', '.git', 'supabase'])
+
+function walkProject(dir = ROOT, out: string[] = []): string[] {
+  for (const entry of readdirSync(dir)) {
+    if (SKIP_DIRECTORIES.has(entry)) continue
+    const full = join(dir, entry)
+    if (statSync(full).isDirectory()) walkProject(full, out)
+    else out.push(full)
+  }
+  return out
+}
+
 // ---------------------------------------------------------------------------
 // 2. No secret-sounding variable may be exposed as NEXT_PUBLIC_.
 //    Anything prefixed NEXT_PUBLIC_ is inlined into the browser bundle by Next.js.
@@ -75,11 +88,10 @@ function checkGitTracked() {
 const FORBIDDEN_IN_PUBLIC = /(SERVICE_ROLE|SECRET|PRIVATE|PASSWORD|_TOKEN|CREDENTIAL|SIGNING|VAULT)/i
 
 function checkPublicVarNames() {
-  const sources = [
-    ...walk(join(ROOT, 'app')), ...walk(join(ROOT, 'lib')),
-    ...walk(join(ROOT, 'scripts')), ...walk(join(ROOT, 'tests')),
-  ].filter((f) => /\.(ts|tsx|js|jsx|mjs)$/.test(f))
-  if (existsSync(join(ROOT, 'proxy.ts'))) sources.push(join(ROOT, 'proxy.ts'))
+  // The whole project, not four named directories. next.config.ts, components/ and
+  // any .cjs/.mts file sat outside the old scope, and a NEXT_PUBLIC_ name is
+  // inlined into the browser bundle from wherever it is written.
+  const sources = walkProject().filter((f) => /\.(m|c)?[jt]sx?$/.test(f))
   if (existsSync(join(ROOT, '.env.example'))) sources.push(join(ROOT, '.env.example'))
 
   const offenders: string[] = []
@@ -102,8 +114,10 @@ function checkAdminClientIsServerOnly() {
     fail("lib/supabase/admin.ts does not import 'server-only', so it could be pulled into a client bundle")
   } else pass("lib/supabase/admin.ts is marked 'server-only'")
 
-  const clientComponents = [...walk(join(ROOT, 'app')), ...walk(join(ROOT, 'lib'))]
-    .filter((f) => /\.(tsx?|jsx?)$/.test(f))
+  // Project-wide: a 'use client' component in components/ importing the
+  // service-role client was outside the old app/ + lib/ scope entirely.
+  const clientComponents = walkProject()
+    .filter((f) => /\.(m|c)?[jt]sx?$/.test(f))
     .filter((f) => /^\s*['"]use client['"]/.test(readFileSync(f, 'utf8')))
 
   const leaks = clientComponents.filter((f) => /supabase\/admin|SERVICE_ROLE/.test(readFileSync(f, 'utf8')))
@@ -136,11 +150,67 @@ function checkAdminClientIsServerOnly() {
 //
 //    So the scan now happens against a running server.
 // ---------------------------------------------------------------------------
+/**
+ * Every server-only variable, given a distinctive value so it can be recognised in
+ * a response.
+ *
+ * These were three hand-picked names, one of which (SUPABASE_DB_PASSWORD) the
+ * project does not even use, while DATABASE_URL and ADMIN_PASSWORD -- both declared
+ * in .env.example, both genuinely secret -- were not canaried at all. A page
+ * printing the database superuser password shipped it to the browser and the check
+ * named "no secret appears in the client bundle" passed.
+ *
+ * So the list is no longer hand-picked: assertCanariesCoverEveryServerVar() below
+ * proves it accounts for every server-only name .env.example declares.
+ */
 const CANARIES = {
   SUPABASE_SERVICE_ROLE_KEY: 'CANARY_SERVICE_ROLE_a1b2c3d4e5f6a7b8',
-  SUPABASE_DB_PASSWORD: 'CANARY_DB_PASSWORD_9f8e7d6c5b4a3928',
   CSRF_SIGNING_SECRET: 'CANARY_CSRF_SECRET_5a4b3c2d1e0f9887_at_least_32_chars',
+  DATABASE_URL: 'postgresql://postgres:CANARY_DB_PASSWORD_9f8e7d6c@127.0.0.1:5432/postgres',
+  ADMIN_PASSWORD: 'CANARY_ADMIN_PASSWORD_3c2d1e0f98877665',
+  ADMIN_EMAIL: 'canary-admin-4b3c2d1e@localhost',
 } as const
+
+/**
+ * Server-only variables that carry no secret AND cannot be canaried, because the
+ * app parses them and a canary value would stop it starting. Each needs a reason.
+ */
+const NOT_CANARYABLE: Record<string, string> = {
+  // Compared against the request origin; a canary value fails every CSRF check.
+  APP_ORIGIN: 'an origin the app must match against real requests',
+  // Parsed as a number.
+  TRUSTED_PROXY_COUNT: 'a small integer, not a credential',
+  // Set per run by the scanner itself and asserted absent from .env.example.
+  SECRET_SCAN_TOKEN: 'generated per run; checked separately by checkScanModeIsNotShipped',
+  // The same project URL that ships publicly as NEXT_PUBLIC_SUPABASE_URL. Canarying
+  // it would flag every legitimate appearance of the public value.
+  SUPABASE_URL: 'the public project URL, also shipped as NEXT_PUBLIC_SUPABASE_URL',
+}
+
+/**
+ * The completeness assertion for the canary list.
+ *
+ * Six review rounds each found a filter narrower than the population it claimed to
+ * cover. A hand-written canary list is exactly that shape, so it is checked against
+ * .env.example -- the file that defines what this app's server-only variables ARE.
+ */
+function assertCanariesCoverEveryServerVar() {
+  const examplePath = join(ROOT, '.env.example')
+  if (!existsSync(examplePath)) { fail('.env.example is missing'); return }
+  const declared = [...readFileSync(examplePath, 'utf8').matchAll(/^([A-Z][A-Z0-9_]*)=/gm)]
+    .map((m) => m[1]!)
+    .filter((name) => !name.startsWith('NEXT_PUBLIC_'))
+
+  const accounted = new Set([...Object.keys(CANARIES), ...Object.keys(NOT_CANARYABLE)])
+  const missing = declared.filter((name) => !accounted.has(name))
+  if (missing.length) {
+    fail(`.env.example declares server-only variables this scan never canaries, so a page `
+      + `printing one would not be caught: ${missing.join(', ')}`)
+  } else {
+    pass(`every server-only variable in .env.example is canaried or declared non-secret `
+      + `(${declared.length} checked)`)
+  }
+}
 
 const PORT = 3987
 const ORIGIN = `http://127.0.0.1:${PORT}`
@@ -178,28 +248,74 @@ function routesFromManifest(): string[] {
 
 /** Each servable URL, and whether it is a route handler (so it accepts more verbs). */
 function routeTable(): Map<string, { isHandler: boolean }> {
-  const manifestPath = join(ROOT, '.next/server/app-paths-manifest.json')
-  if (!existsSync(manifestPath)) return new Map()
-  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, string>
   const routes = new Map<string, { isHandler: boolean }>()
+
+  // BOTH routers. Reading only app-paths-manifest.json meant a `pages/api/*.ts`
+  // endpoint -- a real, built, registered route -- was never fetched: one serving
+  // the service-role key answered an anonymous GET with 200 while this scan
+  // reported the same "8 routes" as a clean tree. tests/app/guards.test.ts bans the
+  // pages router outright; this reads the build output so the ban is enforced from
+  // what was actually compiled, not from what is on disk.
+  const pagesManifest = join(ROOT, '.next/server/pages-manifest.json')
+  if (existsSync(pagesManifest)) {
+    for (const key of Object.keys(JSON.parse(readFileSync(pagesManifest, 'utf8')))) {
+      // /_app, /_document and /_error are framework internals, not app routes.
+      if (/^\/_(app|document|error)$/.test(key)) continue
+      routes.set(fillDynamicSegments(key), { isHandler: key.startsWith('/api/') })
+    }
+  }
+
+  const manifestPath = join(ROOT, '.next/server/app-paths-manifest.json')
+  if (!existsSync(manifestPath)) return routes
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, string>
   for (const key of Object.keys(manifest)) {
     const isHandler = key.endsWith('/route')
     let route = key.replace(/\/(page|route)$/, '')
     if (route.startsWith('/_')) continue
 
-    // Route groups `(marketing)` and parallel slots `@modal` organise files and are
-    // NOT part of the URL. Leaving them in made the scan fetch a path that does not
-    // exist, fail on the 404, and never read the page that does exist.
-    route = route.replace(/\/\([^/]+\)/g, '').replace(/\/@[^/]+/g, '')
-
-    // [...slug] and [[...slug]] take several segments; [id] takes one.
-    route = route
-      .replace(/\[\[?\.\.\.[^\]]+\]\]?/g, 'aaaaaaaa-0000-4000-8000-000000000000/second')
-      .replace(/\[[^\]]+\]/g, 'aaaaaaaa-0000-4000-8000-000000000000')
-
-    routes.set(route === '' ? '/' : route, { isHandler })
+    routes.set(fillDynamicSegments(route), { isHandler })
   }
   return routes
+}
+
+/**
+ * Routes with nothing to inspect, derived from source rather than listed.
+ *
+ * A route that only ever redirects (`/` sends you to the dashboard or to login)
+ * renders no document in any session state, so requiring one would be wrong. But an
+ * exclusion LIST is how the previous version of this scan came to be covering
+ * `/login` and three placeholders, so the set is computed: a page qualifies only if
+ * its source touches no database at all -- the same rule tests/app/guards.test.ts
+ * enforces independently for its RENDERS_NO_DATA pages.
+ */
+function datalessRoutes(): Set<string> {
+  const dataless = new Set<string>()
+  const appDir = join(ROOT, 'app')
+  if (!existsSync(appDir)) return dataless
+  for (const file of walk(appDir)) {
+    if (!/\/page\.(m|c)?[jt]sx?$/.test(file)) continue
+    const source = readFileSync(file, 'utf8')
+    // Anything that touches Supabase or the session is NOT dataless. Matching only
+    // `.from(`/`.rpc(`/`createSupabase` excused /mfa/verify -- which reads the
+    // user's factor list through supabase.auth -- so a page that never rendered
+    // was quietly written off as having nothing to render.
+    if (/supabase|resolveSessionState|requireMfaSession|requireSignedInUser/.test(source)) continue
+    const key = '/' + relative(appDir, file).replace(/\/?page\.(m|c)?[jt]sx?$/, '')
+    dataless.add(fillDynamicSegments(key))
+  }
+  return dataless
+}
+
+/** Turns a manifest key into a URL a browser could actually request. */
+function fillDynamicSegments(key: string): string {
+  // Route groups `(marketing)` and parallel slots `@modal` organise files and are
+  // NOT part of the URL. Leaving them in made the scan fetch a path that does not
+  // exist, fail on the 404, and never read the page that does exist.
+  const route = key.replace(/\/\([^/]+\)/g, '').replace(/\/@[^/]+/g, '')
+    // [...slug] and [[...slug]] take several segments; [id] takes one.
+    .replace(/\[\[?\.\.\.[^\]]+\]\]?/g, 'aaaaaaaa-0000-4000-8000-000000000000/second')
+    .replace(/\[[^\]]+\]/g, 'aaaaaaaa-0000-4000-8000-000000000000')
+  return route === '' ? '/' : route
 }
 
 /**
@@ -216,9 +332,27 @@ function startSupabaseStub(port: number) {
   const server = createServer((req, res) => {
     const url = req.url ?? '/'
     res.setHeader('content-type', 'application/json')
-    if (url.startsWith('/auth/v1/user')) {
-      res.writeHead(401)
-      res.end(JSON.stringify({ message: 'no session' }))
+    if (url.startsWith('/auth/v1/factors') || url.startsWith('/auth/v1/user')) {
+      // A user WITH a verified TOTP factor. Answering 401 here meant
+      // listFactors() came back empty and /mfa/verify redirected to enrolment on
+      // every request, so the one page that renders a factor was never read.
+      res.writeHead(200)
+      res.end(JSON.stringify({
+        id: '00000000-0000-0000-0000-000000000000',
+        email: 'secret-scan@localhost',
+        aud: 'authenticated',
+        app_metadata: {},
+        user_metadata: {},
+        created_at: new Date(0).toISOString(),
+        factors: [{
+          id: '11111111-1111-4111-8111-111111111111',
+          friendly_name: 'scan',
+          factor_type: 'totp',
+          status: 'verified',
+          created_at: new Date(0).toISOString(),
+          updated_at: new Date(0).toISOString(),
+        }],
+      }))
       return
     }
     res.writeHead(200)
@@ -352,8 +486,14 @@ async function checkServedResponses() {
         notRendered.push(`${label} could not be fetched`)
         return
       }
+      // A redirect asked for inside a FLIGHT request is not an HTTP 3xx: Next
+      // answers 200 with a NEXT_REDIRECT digest in the payload. That is the correct
+      // outcome for /mfa/verify seen by a verified session, so it is classified as
+      // a redirect -- still read for canaries -- rather than as an unreadable page.
+      const isFlightRedirect = /NEXT_REDIRECT/.test(doc.text)
+
       // A 200 that is really Next's error boundary carries no page content.
-      if (doc.status === 200 && /__next_error__|"digest":"NEXT_/.test(doc.text)) {
+      if (doc.status === 200 && !isFlightRedirect && /__next_error__|"digest":"NEXT_/.test(doc.text)) {
         notRendered.push(`${label} rendered an error boundary`)
         return
       }
@@ -366,6 +506,10 @@ async function checkServedResponses() {
       if (/service_role/.test(doc.text)) {
         found.push(`the string "service_role" appears in the response for ${label}`)
       }
+      if (isFlightRedirect) {
+        redirected.push(`${label} redirects, expressed in the flight payload`)
+        return
+      }
       if (doc.status >= 300 && doc.status < 400) {
         const destination = doc.location ?? '(no location header)'
         if (!table.has(destination)) {
@@ -376,23 +520,57 @@ async function checkServedResponses() {
       }
     }
 
-    for (const [route, meta] of table) {
-      // A route handler answers more than GET, and a secret can be behind any verb.
-      // A query string can select a different code path entirely: a report route
-      // returning the service-role key only for ?format=full passed a GET-only scan.
-      const requests: Array<[string, Promise<Fetched>]> = [
-        [`${route} (HTML)`, fetchDocument(`${ORIGIN}${route}`)],
-        [`${route} ?query`, fetchDocument(`${ORIGIN}${route}?format=full&all=1&debug=1&raw=true`)],
-      ]
-      if (meta.isHandler) {
-        requests.push([`${route} (POST)`, fetchDocument(`${ORIGIN}${route}`, {}, 'POST')])
-      } else {
-        // The RSC flight payload: what a client-side navigation receives, and where
-        // a server-to-client prop actually lands.
-        requests.push([`${route} (RSC flight)`, fetchDocument(`${ORIGIN}${route}`, { RSC: '1' })])
-      }
+    // Every session state the app can render in. Scanning only as a verified user
+    // meant /mfa/enroll and /mfa/verify -- which redirect a verified user away --
+    // could never render, so three of eight routes were measured as redirects while
+    // the headline said "24 responses scanned".
+    const SCAN_STATES = ['verified', 'needs-verification', 'needs-enrollment'] as const
 
-      for (const [label, pending] of requests) inspect(label, await pending, route)
+    /** Routes that returned a real document in at least one state. */
+    const rendered = new Set<string>()
+    let flightPayloads = 0
+
+    for (const [route, meta] of table) {
+      for (const state of SCAN_STATES) {
+        const as = { [SCAN_STATE_HEADER]: state }
+        // A route handler answers more than GET, and a secret can be behind any verb.
+        // A query string can select a different code path entirely: a report route
+        // returning the service-role key only for ?format=full passed a GET-only scan.
+        const requests: Array<[string, Promise<Fetched>]> = [
+          [`${route} (HTML, ${state})`, fetchDocument(`${ORIGIN}${route}`, as)],
+          [`${route} ?query (${state})`, fetchDocument(`${ORIGIN}${route}?format=full&all=1&debug=1&raw=true`, as)],
+        ]
+        if (meta.isHandler) {
+          requests.push([`${route} (POST, ${state})`, fetchDocument(`${ORIGIN}${route}`, as, 'POST')])
+        } else {
+          // The RSC flight payload: what a client-side navigation receives, and
+          // where a server-to-client prop actually lands.
+          //
+          // The `RSC: 1` header ALONE is not enough. Next requires the `_rsc` query
+          // parameter too and 307s without it -- so all eight flight probes were
+          // redirects, every one silently absorbed into the "redirects to a route
+          // scanned on its own turn" note, and the channel this whole live-server
+          // scan was built to reach was read exactly zero times.
+          // `_rsc` takes NO VALUE. `?_rsc=1` redirects exactly as the bare header
+          // does; only the valueless form returns the payload. Verified by hand
+          // against this build: 307 for `RSC: 1`, 307 for `?_rsc=1`, 200 for `?_rsc`.
+          requests.push([`${route} (RSC flight, ${state})`,
+            fetchDocument(`${ORIGIN}${route}?_rsc`, { ...as, RSC: '1' })])
+        }
+
+        for (const [label, pending] of requests) {
+          const doc = await pending
+          inspect(label, doc, route)
+          // "Rendered" means a document came back, not specifically a 200: Next's
+          // built-in /404 and /500 answer with a real body and real headers, which
+          // is exactly what this scan reads. Only a redirect leaves nothing to read.
+          const isRedirect = (doc.status >= 300 && doc.status < 400) || /NEXT_REDIRECT/.test(doc.text)
+          if (doc.status !== 0 && !isRedirect) {
+            rendered.add(route)
+            if (label.includes('RSC flight')) flightPayloads++
+          }
+        }
+      }
     }
 
     if (redirected.length) {
@@ -401,6 +579,25 @@ async function checkServedResponses() {
     if (notRendered.length) {
       fail(`these responses could not be inspected, so the scan is incomplete:\n    `
         + notRendered.join('\n    '))
+    }
+
+    // Completeness, not volume. "24 responses scanned" was true while 14 of them
+    // were redirect envelopes and none was a flight payload.
+    if (flightPayloads === 0 && table.size > 0) {
+      fail('not one RSC flight payload was read — the channel a server-to-client prop '
+        + 'actually travels on went uninspected while the scan reported success')
+    }
+    const neverRendered = [...table.keys()].filter((route) => !rendered.has(route))
+    const dataless = datalessRoutes()
+    const unexplained = neverRendered.filter((route) => !dataless.has(route))
+    if (unexplained.length) {
+      fail(`these routes never rendered a document in any session state, so nothing was `
+        + `actually inspected for them: ${unexplained.join(', ')}`)
+    }
+    console.log(`  READ  ${rendered.size}/${table.size} route(s) rendered, `
+      + `${flightPayloads} RSC flight payload(s) inspected`)
+    if (neverRendered.length) {
+      console.log(`  NOTE  never rendered (each proven dataless in source): ${neverRendered.join(', ')}`)
     }
 
   } finally {
@@ -455,6 +652,7 @@ async function main() {
   checkPublicVarNames()
   checkAdminClientIsServerOnly()
   checkScanModeIsNotShipped()
+  assertCanariesCoverEveryServerVar()
   await checkServedResponses()
 
   for (const p of passes) console.log(`  PASS  ${p}`)

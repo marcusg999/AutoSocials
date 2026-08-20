@@ -5,7 +5,7 @@ import { redirect } from 'next/navigation'
 import type { SupabaseClient, User } from '@supabase/supabase-js'
 
 import { createSupabaseServerClient } from '@/lib/supabase/server'
-import { SCAN_HEADER, isSecretScanRequest } from '@/lib/security/scan-mode'
+import { SCAN_HEADER, SCAN_STATE_HEADER, isSecretScanRequest, secretScanState } from '@/lib/security/scan-mode'
 import { LOGIN_PATH, MFA_ENROLL_PATH, MFA_VERIFY_PATH } from '@/lib/security/routes'
 
 /** A session that has passed both password and TOTP. Nothing else is ever returned. */
@@ -47,10 +47,22 @@ export async function resolveSessionState(): Promise<SessionState> {
 
   // See lib/security/scan-mode.ts. Only ever true for the local secret scanner,
   // which needs authenticated pages to render so it can inspect what they send.
-  if (isSecretScanRequest((await headers()).get(SCAN_HEADER))) {
-    return {
-      status: 'verified',
-      session: { supabase, userId: '00000000-0000-0000-0000-000000000000', email: null },
+  const requestHeaders = await headers()
+  if (isSecretScanRequest(requestHeaders.get(SCAN_HEADER))) {
+    const scanUserId = '00000000-0000-0000-0000-000000000000'
+    // The scanner asks for a state so it can render the MFA pages too, which a
+    // verified session is redirected away from.
+    switch (secretScanState(requestHeaders.get(SCAN_STATE_HEADER))) {
+      case 'needs-enrollment':
+        return { status: 'needs-enrollment', supabase, user: scanUser(scanUserId, []) }
+      case 'needs-verification':
+        return {
+          status: 'needs-verification',
+          supabase,
+          user: scanUser(scanUserId, [{ id: scanUserId, status: 'verified', factor_type: 'totp' }]),
+        }
+      default:
+        return { status: 'verified', session: { supabase, userId: scanUserId, email: null } }
     }
   }
 
@@ -123,6 +135,19 @@ export async function requireSignedInUserOrThrow(): Promise<PartialSession> {
     return { supabase: state.session.supabase, user: await reloadUser(state.session.supabase) }
   }
   return { supabase: state.supabase, user: state.user }
+}
+
+/** A stand-in user for scan mode only. Never reachable without the scan token. */
+function scanUser(id: string, factors: unknown[]): User {
+  return {
+    id,
+    email: 'secret-scan@localhost',
+    app_metadata: {},
+    user_metadata: {},
+    aud: 'authenticated',
+    created_at: new Date(0).toISOString(),
+    factors,
+  } as unknown as User
 }
 
 async function reloadUser(supabase: SupabaseClient): Promise<User> {

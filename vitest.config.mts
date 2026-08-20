@@ -15,6 +15,9 @@ export default defineConfig({
     fileParallelism: false,
     testTimeout: 60_000,
     hookTimeout: 120_000,
-    include: ['tests/**/*.test.ts'],
+    // Both extensions. Collecting only .test.ts meant a test file written as .tsx
+    // -- the natural extension for anything rendering a component -- would sit in
+    // the repo, never run, and count as coverage to anyone reading the directory.
+    include: ['tests/**/*.test.{ts,tsx}'],
   },
 })
