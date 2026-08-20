@@ -5,7 +5,12 @@ import type { SupabaseClient } from '@supabase/supabase-js'
 
 import { isProduction } from '@/lib/env'
 
-export const ACTIVE_BUSINESS_COOKIE = 'pd_active_business'
+// __Host- in production, matching the CSRF cookie: a browser will only accept it
+// from a secure origin, for path '/', with no Domain attribute, so no sibling or
+// parent subdomain can plant it. The value is re-validated against the RLS-filtered
+// business list on every read anyway, but there is no reason to leave it writable.
+export const ACTIVE_BUSINESS_COOKIE =
+  process.env.NODE_ENV === 'production' ? '__Host-pd_active_business' : 'pd_active_business'
 
 export type Business = {
   id: string

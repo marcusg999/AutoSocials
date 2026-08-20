@@ -27,9 +27,9 @@ export async function switchBusinessAction(formData: FormData): Promise<void> {
   if (error) throw new Error(`Could not verify membership: ${error.message}`)
   if (!data) throw new Error('You are not a member of that business')
 
-  const cookieStore = await cookies()
-  cookieStore.set(ACTIVE_BUSINESS_COOKIE, businessId, activeBusinessCookieOptions())
-
+  // Audited before the cookie is written. The reverse order meant a failing audit
+  // write threw after the switch had already happened, leaving the mutation done
+  // and unrecorded.
   await recordAuditOrThrow({
     action: 'business.switch',
     businessId,
@@ -37,6 +37,9 @@ export async function switchBusinessAction(formData: FormData): Promise<void> {
     targetId: businessId,
     actorUserId: userId,
   })
+
+  const cookieStore = await cookies()
+  cookieStore.set(ACTIVE_BUSINESS_COOKIE, businessId, activeBusinessCookieOptions())
 
   revalidatePath(DASHBOARD_PATH)
 }

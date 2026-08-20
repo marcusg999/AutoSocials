@@ -10,7 +10,14 @@
 -- they read the request.jwt.claims GUC. That is what makes these tests meaningful.
 -- ===========================================================================
 
-create extension if not exists pgcrypto;
+-- Supabase installs extensions into their own schema, never into `public`, because
+-- `public` is exposed by PostgREST as RPC and every extension function would then
+-- be callable by the signed-out `anon` role. Mirrored here so the test database is
+-- not friendlier than production -- pgcrypto's crypt() at a high bcrypt cost is a
+-- one-second-per-call CPU sink, reachable without authentication.
+create schema if not exists extensions;
+create extension if not exists pgcrypto with schema extensions;
+revoke all on schema extensions from public, anon, authenticated;
 
 do $$ begin create role anon           nologin; exception when duplicate_object then null; end $$;
 do $$ begin create role authenticated  nologin; exception when duplicate_object then null; end $$;
@@ -51,16 +58,16 @@ create table if not exists vault.secrets (
 );
 
 create or replace function vault.create_secret(new_secret text, new_name text default null, new_description text default '')
-returns uuid language sql set search_path = public, vault as $$
+returns uuid language sql set search_path = extensions, vault, public as $$
   insert into vault.secrets (name, description, secret)
-  values (new_name, new_description, public.pgp_sym_encrypt(new_secret, 'test-shim-key')::text)
+  values (new_name, new_description, extensions.pgp_sym_encrypt(new_secret, 'test-shim-key')::text)
   returning id;
 $$;
 
 create or replace function vault.update_secret(secret_id uuid, new_secret text default null, new_name text default null, new_description text default null)
-returns void language sql set search_path = public, vault as $$
+returns void language sql set search_path = extensions, vault, public as $$
   update vault.secrets
-     set secret = coalesce(public.pgp_sym_encrypt(new_secret, 'test-shim-key')::text, secret),
+     set secret = coalesce(extensions.pgp_sym_encrypt(new_secret, 'test-shim-key')::text, secret),
          name = coalesce(new_name, name),
          description = coalesce(new_description, description)
    where id = secret_id;
@@ -68,7 +75,7 @@ $$;
 
 create or replace view vault.decrypted_secrets as
   select id, name, description, secret,
-         public.pgp_sym_decrypt(secret::bytea, 'test-shim-key') as decrypted_secret
+         extensions.pgp_sym_decrypt(secret::bytea, 'test-shim-key') as decrypted_secret
     from vault.secrets;
 
 -- Mirrors Supabase: the Vault is not reachable from client roles.

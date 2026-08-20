@@ -2,7 +2,14 @@
 -- Creates the private `app` schema that holds our security helper functions.
 -- Nothing in here is business data; it is the plumbing the RLS policies stand on.
 
-create extension if not exists pgcrypto;
+-- Deliberately no extensions. pgcrypto used to be created here, which put ~36
+-- functions into `public` -- a schema PostgREST exposes as RPC -- every one of them
+-- executable by the signed-out `anon` role. public.crypt() with a high bcrypt cost
+-- is a one-second-per-call CPU sink reachable without authentication.
+--
+-- Nothing here needs it: gen_random_uuid() has been core since PostgreSQL 13. If a
+-- later phase does need pgcrypto, install it into its own schema
+-- (`create extension pgcrypto with schema extensions`), never into public.
 
 -- The `app` schema holds helper functions used by RLS policies.
 -- It is deliberately NOT exposed to PostgREST, so clients can never call these directly.

@@ -1,5 +1,7 @@
 'use server'
 
+import { createHash } from 'node:crypto'
+
 import { redirect } from 'next/navigation'
 
 import { assertCsrf, rotateCsrfToken } from '@/lib/security/csrf'
@@ -30,7 +32,14 @@ export async function signInAction(formData: FormData): Promise<void> {
   // the user would be signed in with no record of it -- the single event most
   // worth having. Recording the attempt first means the trail can never be
   // silently shorter than reality.
-  await recordAuditOrThrow({ action: 'auth.login.attempt', metadata: { email } })
+  // The attempt row carries a hash, not the address. It exists to prove an attempt
+  // happened; the failure row that follows carries the address for the humans
+  // chasing credential stuffing. Two rows per unauthenticated POST is already more
+  // permanent, unprunable data than anyone wants, so this one stays small.
+  await recordAuditOrThrow({
+    action: 'auth.login.attempt',
+    metadata: { email_sha256: createHash('sha256').update(email).digest('hex') },
+  })
 
   const { error } = await supabase.auth.signInWithPassword({ email, password })
 

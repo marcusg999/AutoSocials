@@ -120,11 +120,25 @@ describe('QUALITY BAR: a cross-tenant write is rejected', () => {
     })
   })
 
-  test('Mallory cannot add herself to Alice\'s business', async () => {
+  test('Mallory cannot add herself to Alice\'s business — nor to her own', async () => {
+    // business_members is read-only from the app in Phase 1, so this is refused by
+    // the grant before RLS is consulted. That also closes the oracle the insert
+    // used to provide: user_id is a foreign key into auth.users, so a failed insert
+    // used to reveal whether an arbitrary account existed.
     await asUser(url, MALLORY, 'aal2', async (q) => {
-      const err = await expectRejected(() =>
+      // Savepoints: a rejected statement poisons the surrounding transaction, so
+      // without these the second attempt reports "transaction aborted" rather than
+      // its own error.
+      await q(`savepoint s`)
+      const intoTheirs = await expectRejected(() =>
         q(`insert into public.business_members (business_id, user_id, role) values ($1,$2,'owner')`, [businessA, MALLORY]))
-      expect(err.message).toMatch(/row-level security/i)
+      expect(intoTheirs.message).toMatch(/permission denied/i)
+      await q(`rollback to savepoint s`)
+
+      const intoOwn = await expectRejected(() =>
+        q(`insert into public.business_members (business_id, user_id, role) values ($1,$2,'viewer')`, [businessB, ALICE]))
+      expect(intoOwn.message).toMatch(/permission denied/i)
+      await q(`rollback to savepoint s`)
     })
   })
 

@@ -464,3 +464,87 @@ describe('authorship is set once and never changes', () => {
     })
   })
 })
+
+// ---------------------------------------------------------------------------
+
+describe('CLASS: only the intended roles can execute anything', () => {
+  // The five yes/no helpers an RLS policy needs a signed-in user to be able to call.
+  // Everything else in schema `app` is server-side only.
+  const CALLABLE_BY_AUTHENTICATED = [
+    'has_completed_mfa', 'is_member_of', 'has_role_in', 'post_belongs_to', 'account_belongs_to',
+  ]
+
+  test('no app function is callable by anon, and only the allowlist by authenticated', async () => {
+    // Checking PUBLIC alone is too weak: `authenticated` holds USAGE on schema app,
+    // so a helper granted to it reads every tenant while a PUBLIC-only check stays
+    // green. This asserts all three roles.
+    await asAdmin(url, async (q) => {
+      const r = await q(`
+        select p.proname,
+               has_function_privilege('anon',          p.oid, 'EXECUTE') as anon_exec,
+               has_function_privilege('authenticated', p.oid, 'EXECUTE') as auth_exec,
+               has_function_privilege('public',        p.oid, 'EXECUTE') as public_exec
+        from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+        where n.nspname = 'app' order by p.proname`)
+      expect(r.rowCount).toBeGreaterThan(0)
+      for (const fn of r.rows) {
+        expect(fn.anon_exec,   `app.${fn.proname} is callable by anon`).toBe(false)
+        expect(fn.public_exec, `app.${fn.proname} is callable by PUBLIC`).toBe(false)
+        expect(
+          fn.auth_exec,
+          `app.${fn.proname} is callable by authenticated but is not on the allowlist`,
+        ).toBe(CALLABLE_BY_AUTHENTICATED.includes(fn.proname))
+      }
+    })
+  })
+
+  test('no function in the public schema is callable by anon', async () => {
+    // `public` is what PostgREST exposes as RPC. An extension installed here hands
+    // every one of its functions to signed-out callers -- pgcrypto's crypt() at a
+    // high bcrypt cost is a one-second-per-call CPU sink, unauthenticated.
+    await asAdmin(url, async (q) => {
+      const r = await q(`
+        select p.proname
+        from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+        where n.nspname = 'public' and has_function_privilege('anon', p.oid, 'EXECUTE')
+        order by p.proname`)
+      expect(r.rows.map((x) => x.proname), 'these are reachable by a signed-out caller').toEqual([])
+    })
+  })
+})
+
+describe('CLASS: every business-scoped table is audited', () => {
+  test('any table carrying a business_id has the audit trigger', async () => {
+    // The audited-table list in 0007 is written by hand. A table added by a later
+    // phase would be silently unaudited, and quality bar 4 would quietly stop being
+    // true. This derives the expected set from the schema instead of restating it.
+    await asAdmin(url, async (q) => {
+      const r = await q(`
+        select c.relname,
+               exists (
+                 select 1 from pg_trigger t
+                 where t.tgrelid = c.oid and not t.tgisinternal and t.tgname = 'audit_changes'
+               ) as has_audit_trigger
+        from pg_class c
+        join pg_namespace n on n.oid = c.relnamespace
+        where n.nspname = 'public' and c.relkind = 'r'
+          -- audit_log carries a business_id but must never be audited: a trigger
+          -- writing an audit row for every audit row does not terminate.
+          and c.relname <> 'audit_log'
+          and (
+            c.relname = 'businesses'
+            or exists (
+              select 1 from pg_attribute a
+              where a.attrelid = c.oid and a.attname = 'business_id' and not a.attisdropped
+            )
+          )
+        order by c.relname`)
+
+      expect(r.rowCount, 'no business-scoped tables found — this test would be vacuous')
+        .toBeGreaterThan(0)
+      for (const table of r.rows) {
+        expect(table.has_audit_trigger, `public.${table.relname} is not audited`).toBe(true)
+      }
+    })
+  })
+})

@@ -27,23 +27,22 @@ revoke all on all sequences in schema public from anon, authenticated;
 alter default privileges in schema public revoke all on tables    from anon, authenticated;
 alter default privileges in schema public revoke all on sequences from anon, authenticated;
 
--- Functions need the same treatment, and the danger is different: a new function is
--- not granted to `anon` by Supabase, it is executable by PUBLIC because that is the
--- Postgres default for EVERY function ever created. Combined with
--- `grant usage on schema app to authenticated`, that makes the next SECURITY DEFINER
--- helper anyone writes an RLS bypass on the day it is created.
+-- Function privileges are NOT handled here. Two approaches were tried and both
+-- were wrong, so the reasoning is recorded rather than repeated:
 --
--- Note the missing `in schema` clause, which is NOT an oversight. Postgres accepts
--- `alter default privileges in schema app revoke execute on functions from public`,
--- reports success, stores nothing, and changes nothing -- a silent no-op. The
--- built-in PUBLIC EXECUTE default is global, so only an unqualified statement can
--- cancel it. Verified: with `in schema`, a newly created function is still
--- PUBLIC-executable; without it, it is not.
+--   `alter default privileges in schema app revoke execute on functions from public`
+--     is a silent no-op. Postgres accepts it, reports success, writes no
+--     pg_default_acl row and changes nothing, because the built-in PUBLIC EXECUTE
+--     default is global and a schema-scoped revoke has nothing to subtract.
 --
--- The consequence is deliberate: from here on every function needs an explicit
--- grant to be callable, including any PostgREST RPC a later phase adds. That is
--- the posture this schema already follows everywhere else.
-alter default privileges revoke execute on functions from public;
+--   the same statement without `in schema` does work, but it applies to EVERY
+--     schema and is recorded against one role. A function created by any other
+--     role reopens the hole, and -- worse -- every future `create extension`
+--     installs a type whose operators raise "permission denied" for authenticated.
+--     Verified with citext: `'ABC'::citext = 'abc'::citext` failed outright.
+--
+-- Instead, 0010_lock_down_functions.sql revokes explicitly across schema `app`
+-- after every function exists, and re-grants exactly the four the app needs.
 
 -- `anon` is granted nothing at all: a signed-out visitor cannot touch any table.
 grant select                          on public.businesses        to authenticated;
@@ -52,7 +51,13 @@ grant select                          on public.businesses        to authenticat
 -- rewrite created_by -- forging provenance, and turning the foreign key into a
 -- platform-wide "does this user exist?" probe -- and rewrite created_at.
 grant update (name, timezone)         on public.businesses        to authenticated;
-grant select, insert, update, delete on public.business_members  to authenticated;
+-- SELECT only. Adding a member takes a user id from the caller, and `user_id` is a
+-- foreign key into auth.users -- a table nobody can read -- so an INSERT turned the
+-- error message into a platform-wide "does this account exist?" probe, and a
+-- successful one attached a real person to a business without their consent. Phase 1
+-- has a single administrator and manages membership from the seed script under
+-- service_role, so the app needs no write access at all.
+grant select                          on public.business_members  to authenticated;
 grant select, delete                 on public.social_accounts   to authenticated;
 grant select, insert, delete          on public.posts             to authenticated;
 
@@ -134,6 +139,10 @@ create policy businesses_update_by_manager on public.businesses for update to au
 
 -- ===========================================================================
 -- business_members
+--
+-- Read-only from the application in Phase 1. Membership is granted by the seed
+-- script under service_role; there are deliberately no INSERT, UPDATE or DELETE
+-- policies, so all three are denied by default.
 -- ===========================================================================
 
 -- You can see the membership list of a business only if you are a member of it.
@@ -141,21 +150,8 @@ drop policy if exists members_select_own_business on public.business_members;
 create policy members_select_own_business on public.business_members for select to authenticated
   using (app.is_member_of(business_id));
 
--- Only an owner of a business may add someone to it.
-drop policy if exists members_insert_by_owner on public.business_members;
-create policy members_insert_by_owner on public.business_members for insert to authenticated
-  with check (app.has_role_in(business_id, array['owner']::public.member_role[]));
 
--- Only an owner of a business may change someone's role, and only within that same business.
-drop policy if exists members_update_by_owner on public.business_members;
-create policy members_update_by_owner on public.business_members for update to authenticated
-  using      (app.has_role_in(business_id, array['owner']::public.member_role[]))
-  with check (app.has_role_in(business_id, array['owner']::public.member_role[]));
 
--- Only an owner of a business may remove someone from it.
-drop policy if exists members_delete_by_owner on public.business_members;
-create policy members_delete_by_owner on public.business_members for delete to authenticated
-  using (app.has_role_in(business_id, array['owner']::public.member_role[]));
 
 
 -- ===========================================================================

@@ -543,6 +543,132 @@ Rate limiting is still absent and is listed below as a known limitation.
 
 ---
 
+## Gotchas found by the fourth adversarial review
+
+Round 4 opened by correcting a claim in the handover: **the suite was red, not
+green.** 196 of 197 passed. That correction is the most useful thing in this
+section, and the cause is worth more than the symptom.
+
+### G48 — A test that reads build output will report on code that no longer exists
+`tests/app/proxy-registration.test.ts` reads
+`.next/server/functions-config-manifest.json`. The verification run that declared
+"197 tests pass" ran vitest **before** `scripts/check-no-secrets.ts` rebuilt
+`.next`, so it checked a manifest built from source that had since changed. The
+matcher change contradicted an assertion in that file and the contradiction was
+invisible for a whole round.
+
+Two fixes, because either alone would leave the trap: the test now compares
+`proxy.ts`'s mtime against the manifest's and refuses to run against a stale build,
+and `npm run verify` sequences build → typecheck → test → secret scan so the
+question cannot arise. **Any check that reads a build artifact is really a check on
+"when did you last build", and will lie if asked out of order.**
+
+### G49 — Round 3 fixed the precision of every check and none of their scope
+The round's central result. Each rebuilt check used a better *predicate* on a
+*narrower domain* than the property it claimed:
+
+| Check | Precision fixed | Scope still wrong |
+|---|---|---|
+| Function ACLs | `has_function_privilege` not `proacl` | schema `app` only, PUBLIC only |
+| Server actions | three declaration forms | `.ts` only, no `route.ts`, `export *` invisible |
+| Secret scan | live responses not build output | unauthenticated only |
+
+Every one had a demonstrated instance where the check passed and the property was
+false. All are now fixed **and re-verified by replaying the exact bypass**, which is
+the only way to know a test tests anything.
+
+### G50 — The secret scan measured redirects and called them pages
+Every route but `/login` is behind the auth gate, so fetching them unauthenticated
+returned a 307 whose body is the six bytes `/login`. The scan reported "16 served
+responses" while inspecting one page, and passed with the service-role key rendered
+on the dashboard.
+
+Three changes: a tightly-fenced scan mode (`lib/security/scan-mode.ts`) lets the
+scanner render authenticated pages; **any response that is not a 200 now fails the
+scan as incomplete** rather than being counted; and routes that genuinely cannot
+render without a live Supabase project are named in the output as unscanned. That
+last point matters — the honest result is "12 responses scanned, 4 could not be",
+not a green tick over a silent gap. Re-verified: the leak on a guarded page is now
+caught in both the HTML and the RSC flight payload.
+
+### G51 — Three kinds of server entry point the guard test could not see
+Each was added to the tree and the suite stayed at 29/29 green:
+- **`route.ts` handlers** were collected and then grepped only for
+  `exchangeCodeForSession`. An unguarded `GET /dashboard/export` returning
+  `select * from businesses` passed.
+- **`'use server'` in a `.tsx` file** — the collector filtered `.endsWith('.ts')`.
+  Actions colocated with a component are idiomatic Next and were invisible.
+- **`export * from './hidden'`** — neither the "recognised actions" set nor the
+  "all exports" set can see through it, so the equality assertion added in round 3
+  was satisfied by both sides being equally blind.
+
+All three now fail. `export *` inside a `'use server'` module is banned outright,
+because there is no way to follow it with a regex and a check that cannot see
+something must not pretend otherwise.
+
+### G52 — A guard satisfied by a comment, and one that accepts aal1
+The guard assertions matched raw source text, so `// await assertCsrf(formData)`
+passed. Comments are now stripped before matching.
+
+Worse: the session assertion accepted `requireSignedInUserOrThrow`, which by design
+returns a **password-only, aal1** session. Any action could satisfy criterion 3 with
+a guard that does not enforce criterion 3. That is now allowed by path — inside
+`app/mfa/**`, where aal2 does not exist yet, and `signOutAction`, because a user who
+cannot complete MFA must still be able to leave — and everywhere else
+`requireMfaSessionOrThrow` is required.
+
+### G53 — `pgcrypto` put 36 anon-callable functions into `public`
+`create extension pgcrypto` with no schema clause lands in `public`, which PostgREST
+exposes as RPC, and every function in it was callable by the signed-out `anon` role.
+`public.crypt()` at bcrypt cost 14 takes about a second of database CPU per call;
+the cost parameter goes to 31.
+
+Nothing needed it — `gen_random_uuid()` has been core since PostgreSQL 13, and only
+the test shim's stand-in Vault uses pgcrypto. The extension is gone from the
+migrations entirely, and the shim now installs it into an `extensions` schema the
+way Supabase does, so the test database is no longer friendlier than production.
+Count of public functions reachable by `anon`: 36 → **0**.
+
+### G54 — The default-privilege revoke was role-scoped and broke `CREATE EXTENSION`
+The unqualified form from round 3 works, but two things were missed. It is recorded
+against the role that runs it, so a function created by any other role is unprotected
+— that is now the class test's job, and the test checks `anon`, `authenticated` and
+`PUBLIC`, not just `PUBLIC`. And because it is unqualified it applies to every
+schema, so any extension installed into `public` produces a type whose operators
+raise `permission denied` for `authenticated`; verified with `citext`, where
+`'ABC'::citext = 'abc'::citext` failed outright.
+
+Both are addressed in `0010_lock_down_functions.sql`, which revokes explicitly
+across schema `app` after every function exists, re-grants exactly the five a
+browser session may call, and establishes the `extensions` schema convention so
+future extensions keep working.
+
+### G55 — `business_members` was the same FK oracle, one table over
+Round 3 closed the `posts.created_by` existence oracle and did not generalise it.
+`business_members.user_id` is a foreign key into `auth.users` and nothing pinned it:
+a non-existent id raised a foreign-key error, a real one succeeded, so an owner could
+probe the whole platform for account existence — and silently attach a real person
+to a business they had never heard of, with role `owner`.
+
+Phase 1 has a single administrator and manages membership from the seed script under
+`service_role`, so the fix is that the application has no write access to the table
+at all. **The narrowest correct scope is usually the fix.**
+
+### G56 — A caller-controlled header could make the audit write throw
+`clientIp()` filtered with a character class, so `....` and `::::` passed it and then
+raised `invalid input syntax for type inet` *inside* `app.write_audit`. Combined with
+`switchBusinessAction` writing its cookie before auditing, a chosen header made the
+mutation succeed and its audit row throw. The address is now parsed properly and an
+unparseable one is recorded as null, and the audit row is written before the cookie.
+
+### G57 — Auditing an audit log does not terminate
+While writing the class test asserting every business-scoped table has an audit
+trigger, `audit_log` failed it — it carries a `business_id` and is deliberately not
+audited, because a trigger writing an audit row for every audit row recurses forever.
+Excluded with the reason stated, rather than by quietly narrowing the query.
+
+---
+
 ## Known, accepted limitations
 
 Stated plainly rather than left to be discovered.
@@ -573,13 +699,22 @@ Stated plainly rather than left to be discovered.
    server-side caller could record an action that did not happen. Only `service_role`
    can reach it, so this is a compromised-server scenario, not a tenant one — but
    note `metadata.actor_source` will read `caller`, not `jwt`, for every such row.
-8. **There is no rate limiting anywhere.** `signInAction` in particular can be
+8. **Scan mode is a bypass, and bypasses are risk.** `lib/security/scan-mode.ts`
+   lets the local secret scanner render authenticated pages. It is inert unless
+   `SECRET_SCAN_TOKEN` is set, requires a matching header compared in constant time,
+   refuses to run unless `APP_ORIGIN` is a local address, and is deliberately absent
+   from `.env.example`. The scanner asserts all four fences. It is still a bypass,
+   and it is the single thing in this codebase most worth re-reading before deploy.
+9. **The secret scan cannot render four routes** without a live Supabase project
+   (`/dashboard` and the three that redirect to it). They are named in the output as
+   unscanned rather than counted. Against a real project that list should be empty.
+10. **There is no rate limiting anywhere.** `signInAction` in particular can be
    called repeatedly by an unauthenticated caller, and each failure appends a row to
    a table that by design can never be pruned. The email is capped at 320 characters
    so the growth is bounded per attempt, but not in total.
-9. **There is no retention or erasure path for audit_log.** Append-only is enforced
+11. **There is no retention or erasure path for audit_log.** Append-only is enforced
    against every role, which is the point — and it means a GDPR erasure request
    touching the failed-login rows cannot currently be honoured.
-10. **`TRUSTED_PROXY_COUNT` must match the deployment.** The audit IP is read that
+12. **`TRUSTED_PROXY_COUNT` must match the deployment.** The audit IP is read that
    many entries from the end of `X-Forwarded-For`. Set it wrong and the recorded
    address is wrong — silently.

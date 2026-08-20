@@ -77,17 +77,28 @@ describe('every insert, update and delete is recorded', () => {
     expect(rows.map((r) => r.action)).toEqual(['posts.delete'])
   })
 
-  test.each([
-    ['social_accounts', `insert into public.social_accounts (business_id, platform, label) values ($1,'tiktok','t')`],
-    ['business_members', `insert into public.business_members (business_id, user_id, role) values ($1,'33333333-3333-3333-3333-333333333333','viewer')`],
-  ])('inserting into %s is audited', async (table, sql) => {
+  test('inserting a social account is audited', async () => {
+    const rows = await auditRowsFor(async () => {
+      await asUser(url, ALICE, 'aal2', async (q) => {
+        await q(`insert into public.social_accounts (business_id, platform, label) values ($1,'tiktok','t')`, [businessA])
+      })
+    })
+    expect(rows.some((r) => r.action === 'social_accounts.insert' && r.business_id === businessA)).toBe(true)
+  })
+
+  test('membership granted by the seed script is audited, even though the app cannot grant it', async () => {
+    // business_members is read-only from the app, so this path runs under
+    // service_role. The trigger does not care who did it -- which is the point of
+    // auditing in the database rather than in the application.
     await asAdmin(url, async (q) => {
       await q(`insert into auth.users (id, email) values ('33333333-3333-3333-3333-333333333333','c@example.com') on conflict do nothing`)
     })
     const rows = await auditRowsFor(async () => {
-      await asUser(url, ALICE, 'aal2', async (q) => { await q(sql, [businessA]) })
+      await asAdmin(url, async (q) => {
+        await q(`insert into public.business_members (business_id, user_id, role) values ($1,'33333333-3333-3333-3333-333333333333','viewer')`, [businessA])
+      })
     })
-    expect(rows.some((r) => r.action === `${table}.insert` && r.business_id === businessA)).toBe(true)
+    expect(rows.some((r) => r.action === 'business_members.insert' && r.business_id === businessA)).toBe(true)
   })
 
   test('scheduling a post is audited against the business of its parent post', async () => {

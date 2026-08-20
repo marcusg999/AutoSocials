@@ -5,11 +5,15 @@
  * the app renders perfectly and is completely unguarded. Next 16 renamed
  * middleware.ts to proxy.ts, so the old filename produces exactly that.
  *
+ * Run `npm run verify` rather than `npm test` alone: this file reads BUILD OUTPUT,
+ * so the build has to be current. There is a staleness guard below, but the script
+ * ordering is what stops the question arising.
+ *
  * Note this reads functions-config-manifest.json, NOT middleware-manifest.json.
  * The latter is a legacy webpack artifact that Turbopack leaves empty on every
  * build, so checking it would report a false failure every time.
  */
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, test } from 'vitest'
 
@@ -19,6 +23,20 @@ function manifest() {
   if (!existsSync(MANIFEST)) {
     throw new Error('No production build found. Run `npm run build` before this test.')
   }
+
+  // This test reads BUILD OUTPUT, so a stale .next reports on source that no longer
+  // exists. That is not hypothetical: a matcher change was once verified green
+  // against a manifest built before the change, and the contradiction only surfaced
+  // on the next build. Refuse to answer rather than answer about the wrong code.
+  const builtAt = statSync(MANIFEST).mtimeMs
+  const sourceAt = statSync(join(process.cwd(), 'proxy.ts')).mtimeMs
+  if (sourceAt > builtAt) {
+    throw new Error(
+      'proxy.ts is newer than the production build, so this test would be checking '
+      + 'stale output. Run `npm run build` and try again.',
+    )
+  }
+
   return JSON.parse(readFileSync(MANIFEST, 'utf8'))
 }
 
@@ -42,7 +60,18 @@ describe('the proxy is registered in the production build', () => {
     expect(regexp.test(path), `${path} is not covered by the proxy matcher`).toBe(true)
   })
 
-  test.each(['/_next/static/chunk.js', '/_next/image', '/favicon.ico', '/logo.png'])(
+  test.each([
+    '/robots.txt', '/sitemap.xml', '/dashboard/export.json', '/reports/tenant.csv',
+  ])('the proxy still runs for %s, which could carry tenant data', (path) => {
+    // Excluding these by extension is how an export endpoint ends up unguarded.
+    const regexp = new RegExp(manifest().functions['/_middleware'].matchers[0].regexp)
+    expect(regexp.test(path)).toBe(true)
+  })
+
+  test.each([
+    '/_next/static/chunk.js', '/_next/image', '/favicon.ico',
+    '/logo.png', '/hero.webp', '/font.woff2', '/promo.mp4',
+  ])(
     'the proxy is skipped for the static asset %s',
     (path) => {
       const regexp = new RegExp(manifest().functions['/_middleware'].matchers[0].regexp)

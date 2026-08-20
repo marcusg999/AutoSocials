@@ -23,6 +23,7 @@ import {
   isPublicPath,
 } from '@/lib/security/routes'
 import { isProduction, supabaseOrigin } from '@/lib/env'
+import { SCAN_HEADER, isSecretScanRequest } from '@/lib/security/scan-mode'
 
 export async function proxy(request: NextRequest): Promise<NextResponse> {
   const nonce = randomBytes(16).toString('base64')
@@ -43,6 +44,10 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
   const csrf = issueCsrfToken(request, user?.id ?? null)
   if (csrf.isNew) attachCsrfCookie(response, csrf.token)
   applySecurityHeaders(response, csp)
+
+  // The secret scanner needs pages to actually render so it can read them. See
+  // lib/security/scan-mode.ts for the four fences around this.
+  if (isSecretScanRequest(request.headers.get(SCAN_HEADER))) return response
 
   const { pathname } = request.nextUrl
   const target = destinationFor(pathname, user !== null, aal?.currentLevel ?? null, aal?.nextLevel ?? null)
@@ -141,12 +146,14 @@ function contentSecurityPolicy(nonce: string): string {
 
 export const config = {
   matcher: [
-    // Everything except Next's own build output and the static asset directory.
+    // Everything except Next's own build output and genuinely static media.
     //
-    // Excluded by LOCATION, not by file extension. An extension list quietly
-    // exempts any future route that happens to end in one of them -- an export,
-    // a feed, a sitemap route handler -- leaving it unguarded and without security
-    // headers on the day it is added.
-    '/((?!_next/static|_next/image|favicon\\.ico$).*)',
+    // Files in `public/` are served from the root, so they can only be excluded by
+    // extension. The list is restricted to formats that cannot carry application
+    // data -- images, fonts, media. Data-bearing extensions are deliberately NOT
+    // here: a `.json`, `.txt`, `.xml` or `.csv` route is exactly the shape an
+    // export endpoint takes, and exempting it would leave it unguarded and without
+    // security headers on the day someone adds one.
+    '/((?!_next/static|_next/image|favicon\\.ico$|.*\\.(?:svg|png|jpg|jpeg|gif|webp|avif|ico|woff|woff2|ttf|otf|eot|mp4|webm|mp3|wav)$).*)',
   ],
 }

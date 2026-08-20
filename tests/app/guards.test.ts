@@ -20,10 +20,26 @@ function walk(dir: string, out: string[] = []): string[] {
   return out
 }
 
-const appFiles = walk('app')
-const actionFiles = appFiles.filter((f) => f.endsWith('.ts') && /['"]use server['"]/.test(readFileSync(f, 'utf8')))
+const appFiles = walk('app').concat(walk('lib'))
+
+/**
+ * A 'use server' module can be .ts OR .tsx -- an actions file colocated with a
+ * component, or inline actions inside one, are both idiomatic Next. Filtering to
+ * .ts alone made every .tsx action invisible to this whole file.
+ */
+const actionFiles = appFiles.filter(
+  (f) => /\.tsx?$/.test(f) && /['"]use server['"]/.test(readFileSync(f, 'utf8')),
+)
 const pageFiles = appFiles.filter((f) => /\/page\.tsx$/.test(f))
-const routeHandlers = appFiles.filter((f) => /\/route\.ts$/.test(f))
+const layoutFiles = appFiles.filter((f) => /\/(layout|template)\.tsx$/.test(f))
+const routeHandlers = appFiles.filter((f) => /\/route\.tsx?$/.test(f))
+
+/** Source with comments removed, so a commented-out guard cannot satisfy a match. */
+function code(file: string): string {
+  return readFileSync(file, 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/(^|[^:])\/\/.*$/gm, '$1')
+}
 
 /**
  * Every exported binding in a 'use server' file is a callable server action.
@@ -40,7 +56,7 @@ const DECLARATION_FORMS = [
 ]
 
 function exportedActions(file: string): string[] {
-  const source = readFileSync(file, 'utf8')
+  const source = code(file)
   const names = new Set<string>()
   for (const pattern of DECLARATION_FORMS) {
     for (const match of source.matchAll(pattern)) names.add(match[1]!)
@@ -51,7 +67,7 @@ function exportedActions(file: string): string[] {
 /** Every exported binding at all, however it is declared. Used to prove the
  *  matchers above did not silently miss one. */
 function everyExportedBinding(file: string): string[] {
-  const source = readFileSync(file, 'utf8')
+  const source = code(file)
   const names = new Set<string>()
   for (const m of source.matchAll(/export\s+(?:async\s+)?(?:function|const|let|var)\s+(\w+)/g)) {
     names.add(m[1]!)
@@ -72,7 +88,7 @@ function everyExportedBinding(file: string): string[] {
  * helper below satisfied the check for an action that never called it.
  */
 function bodyOf(file: string, name: string): string {
-  const source = readFileSync(file, 'utf8')
+  const source = code(file)
   const start = source.search(new RegExp(`export\\s+(?:default\\s+)?(?:async\\s+function\\s+${name}\\b|(?:const|let|var)\\s+${name}\\b)`))
   if (start === -1) throw new Error(`could not locate ${name} in ${file}`)
   const rest = source.slice(start + 1)
@@ -84,6 +100,16 @@ test('there is at least one server action to check, so this test cannot pass vac
   expect(actionFiles.length).toBeGreaterThan(0)
   expect(actionFiles.flatMap(exportedActions).length).toBeGreaterThan(0)
 })
+
+test.each(actionFiles.map((f) => relative(process.cwd(), f)))(
+  '%s — does not re-export actions with `export *`, which would hide them entirely',
+  (file) => {
+    // `export *` makes an action callable while appearing in neither the recognised
+    // set nor the all-exports set, so the equality check below passes and the action
+    // is never examined. There is no way to follow it with a regex, so it is banned.
+    expect(code(join(process.cwd(), file)), `${file} uses \`export *\`; name each action explicitly`)
+      .not.toMatch(/export\s+\*/)
+  })
 
 test.each(actionFiles.map((f) => relative(process.cwd(), f)))(
   '%s — every exported binding is recognised as an action, so none can slip past unchecked',
@@ -117,13 +143,25 @@ describe('every server action', () => {
   // The only action that may not require a session is the one that creates it.
   const CREATES_THE_SESSION = new Set(['signInAction'])
 
+  // requireSignedInUserOrThrow accepts a PASSWORD-ONLY (aal1) session. That is
+  // necessary inside the MFA flow, which by definition runs before aal2 exists, and
+  // for signing out -- a user who cannot complete MFA must still be able to leave.
+  // Anywhere else it is not a guard at all, so it is allowed by PATH, not by habit.
+  const MAY_ACCEPT_AAL1 = (file: string, name: string) =>
+    file.startsWith('app/mfa/') || name === 'signOutAction'
+
   test.each(everyAction)('%s → %s() independently establishes the session', (file, name) => {
     if (CREATES_THE_SESSION.has(name)) return
     const body = bodyOf(join(process.cwd(), file), name)
     // Next.js routes server actions as POSTs to the page they live on, so the
     // proxy's matcher cannot be relied on to have covered them.
-    expect(body, `${name} relies on the proxy alone`).toMatch(
-      /require(MfaSession|SignedInUser)OrThrow\(/)
+    if (MAY_ACCEPT_AAL1(file, name)) {
+      expect(body, `${name} relies on the proxy alone`).toMatch(
+        /require(MfaSession|SignedInUser)OrThrow\(/)
+    } else {
+      expect(body, `${name} accepts a password-only session; it needs requireMfaSessionOrThrow`)
+        .toMatch(/requireMfaSessionOrThrow\(/)
+    }
   })
 })
 
@@ -159,6 +197,39 @@ describe('every page', () => {
 
     expect(source, `${file} renders without requireMfaSession()`).toMatch(/requireMfaSession\(/)
   })
+})
+
+describe('every route handler', () => {
+  const MUTATING = ['POST', 'PUT', 'PATCH', 'DELETE']
+
+  test('there are none, or each one is guarded', () => {
+    // Route handlers are a separate entry point from server actions and were
+    // previously checked for nothing but exchangeCodeForSession. An unguarded
+    // GET /dashboard/export returning `select * from businesses` would have passed.
+    for (const file of routeHandlers) {
+      const relPath = relative(process.cwd(), file)
+      const source = code(file)
+      const methods = [...source.matchAll(/export\s+async\s+function\s+(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)/g)]
+        .map((m) => m[1]!)
+
+      expect(source, `${relPath} does not establish a session`).toMatch(/requireMfaSession(OrThrow)?\(/)
+
+      if (methods.some((m) => MUTATING.includes(m))) {
+        expect(source, `${relPath} mutates without a CSRF check`).toMatch(/assertCsrf\(/)
+      }
+    }
+  })
+})
+
+test('no layout or template renders tenant data without establishing a session', () => {
+  // A layout wraps every page beneath it and can query just as freely.
+  for (const file of layoutFiles) {
+    const source = code(file)
+    if (/\.from\(|\.rpc\(/.test(source)) {
+      expect(source, `${relative(process.cwd(), file)} queries the database without a session guard`)
+        .toMatch(/requireMfaSession\(/)
+    }
+  }
 })
 
 test('no route handler exchanges a query parameter for a session', () => {

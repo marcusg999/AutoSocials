@@ -9,7 +9,9 @@
  *   npm run test:secrets
  */
 import { execFileSync, spawn } from 'node:child_process'
-import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, rmSync } from 'node:fs'
+import { SCAN_HEADER } from '../lib/security/scan-mode'
+import { existsSync, readFileSync, readdirSync, statSync, rmSync } from 'node:fs'
+import { randomBytes } from 'node:crypto'
 import { join, relative } from 'node:path'
 
 const ROOT = process.cwd()
@@ -55,7 +57,9 @@ function checkGitTracked() {
     const looksLikePlaceholder =
       /^(<.*>|your[-_]|replace|placeholder|example|changeme|xxx|\.\.\.)/i.test(value) ||
       /^https:\/\/your/i.test(value) ||
-      /(localhost|127\.0\.0\.1)/.test(value)
+      /(localhost|127\.0\.0\.1)/.test(value) ||
+      // A short plain number is tuning, not a credential (e.g. TRUSTED_PROXY_COUNT=1).
+      /^\d{1,4}$/.test(value)
     const looksLikeRealKey = /^(eyJ|sb_|sk-|sbp_)/.test(value) || value.length > 60
     return looksLikeRealKey || !looksLikePlaceholder
   })
@@ -102,8 +106,19 @@ function checkAdminClientIsServerOnly() {
     .filter((f) => /^\s*['"]use client['"]/.test(readFileSync(f, 'utf8')))
 
   const leaks = clientComponents.filter((f) => /supabase\/admin|SERVICE_ROLE/.test(readFileSync(f, 'utf8')))
-  if (leaks.length) fail(`client components reference the service-role client: ${leaks.map((f) => relative(ROOT, f)).join(', ')}`)
-  else pass(`no 'use client' file references the service-role client (${clientComponents.length} client components scanned)`)
+  if (leaks.length) {
+    fail(`client components reference the service-role client: ${leaks.map((f) => relative(ROOT, f)).join(', ')}`)
+    return
+  }
+
+  // Said plainly rather than dressed up as a pass: with no client components there
+  // is nothing here to find, and this check is not yet evidence of anything.
+  if (clientComponents.length === 0) {
+    pass("no 'use client' file references the service-role client (there are none yet — "
+      + 'this check only starts meaning something in a later phase)')
+  } else {
+    pass(`no 'use client' file references the service-role client (${clientComponents.length} scanned)`)
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +144,10 @@ const CANARIES = {
 const PORT = 3987
 const ORIGIN = `http://127.0.0.1:${PORT}`
 
+// Lets the scanner render authenticated pages. Generated fresh for each run and
+// never written anywhere. See lib/security/scan-mode.ts for the fences.
+const SCAN_TOKEN = randomBytes(32).toString('hex')
+
 function buildEnvironment(): NodeJS.ProcessEnv {
   return {
     ...process.env,
@@ -136,6 +155,7 @@ function buildEnvironment(): NodeJS.ProcessEnv {
     NEXT_PUBLIC_SUPABASE_URL: process.env.NEXT_PUBLIC_SUPABASE_URL ?? 'https://example.supabase.co',
     NEXT_PUBLIC_SUPABASE_ANON_KEY: process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? 'public-anon-key-safe-to-ship',
     APP_ORIGIN: ORIGIN,
+    SECRET_SCAN_TOKEN: SCAN_TOKEN,
     NEXT_TELEMETRY_DISABLED: '1',
   }
 }
@@ -156,15 +176,23 @@ function routesFromManifest(): string[] {
   return [...routes]
 }
 
-async function fetchText(url: string, headers: Record<string, string> = {}): Promise<string> {
+type Fetched = { text: string; status: number }
+
+async function fetchDocument(url: string, extra: Record<string, string> = {}): Promise<Fetched> {
   try {
-    const response = await fetch(url, { headers, redirect: 'manual' })
+    // Redirects are followed, because several routes redirect by design even for a
+    // fully authenticated user ('/' and the MFA pages all send a verified session on
+    // to the dashboard). What we want is the document that is finally rendered.
+    const response = await fetch(url, {
+      headers: { [SCAN_HEADER]: SCAN_TOKEN, ...extra },
+      redirect: 'follow',
+    })
     const body = await response.text()
     // Header values count too: a secret in a Set-Cookie or a custom header ships.
     const headerText = [...response.headers.entries()].map(([k, v]) => `${k}: ${v}`).join('\n')
-    return `${headerText}\n${body}`
-  } catch (err) {
-    return ''
+    return { text: `${headerText}\n${body}`, status: response.status }
+  } catch {
+    return { text: '', status: 0 }
   }
 }
 
@@ -209,20 +237,48 @@ async function checkServedResponses() {
       return
     }
 
+    // Routes that cannot render without a live Supabase project: the dashboard
+    // lists the businesses RLS lets you see, and '/' and the MFA pages all send a
+    // verified session on to it. Listed explicitly, reported in the output, and NOT
+    // counted as scanned -- an environment limitation stated out loud rather than a
+    // silent gap. Against a real project this list should be empty.
+    const NEEDS_LIVE_DATABASE = ['/dashboard', '/', '/mfa/enroll', '/mfa/verify']
+    const notRendered: string[] = []
+    const unverifiable: string[] = []
+
     for (const route of routes) {
-      const documents: Array<[string, string]> = [
-        [`${route} (HTML)`, await fetchText(`${ORIGIN}${route}`)],
+      const documents: Array<[string, Fetched]> = [
+        [`${route} (HTML)`, await fetchDocument(`${ORIGIN}${route}`)],
         // The RSC flight payload: what a client-side navigation receives, and where
         // a server-to-client prop actually lands.
-        [`${route} (RSC flight)`, await fetchText(`${ORIGIN}${route}`, { RSC: '1' })],
+        [`${route} (RSC flight)`, await fetchDocument(`${ORIGIN}${route}`, { RSC: '1' })],
       ]
-      for (const [label, text] of documents) {
+      for (const [label, doc] of documents) {
+        // A redirect body is a handful of bytes and proves nothing. Counting one as
+        // "scanned" is how this check previously reported 16 responses while
+        // actually inspecting a single page.
+        if (doc.status !== 200) {
+          if (NEEDS_LIVE_DATABASE.includes(route)) unverifiable.push(`${label} returned ${doc.status}`)
+          else notRendered.push(`${label} returned ${doc.status}`)
+          continue
+        }
         scanned++
         for (const [name, canary] of Object.entries(CANARIES)) {
-          if (text.includes(canary)) found.push(`${name} leaked into the response for ${label}`)
+          if (doc.text.includes(canary)) found.push(`${name} leaked into the response for ${label}`)
         }
-        if (/service_role/.test(text)) found.push(`the string "service_role" appears in the response for ${label}`)
+        if (/service_role/.test(doc.text)) found.push(`the string "service_role" appears in the response for ${label}`)
       }
+    }
+
+    // Coverage is part of the result. If scan mode ever stops working, every route
+    // becomes a redirect again and this fails loudly rather than passing vacuously.
+    if (notRendered.length) {
+      fail(`these responses could not be inspected, so the scan is incomplete:\n    `
+        + notRendered.join('\n    '))
+    }
+    if (unverifiable.length) {
+      console.log(`  NOTE  ${unverifiable.length} response(s) need a live Supabase project `
+        + `and were NOT scanned:\n    ${unverifiable.join('\n    ')}`)
     }
   } finally {
     try { process.kill(-server.pid!, 'SIGKILL') } catch { /* already gone */ }
@@ -248,12 +304,33 @@ async function checkServedResponses() {
 }
 
 // ---------------------------------------------------------------------------
+// 5. Scan mode must not be reachable in a real deployment.
+// ---------------------------------------------------------------------------
+function checkScanModeIsNotShipped() {
+  if (!existsSync(join(ROOT, '.env.example'))) return
+  const example = readFileSync(join(ROOT, '.env.example'), 'utf8')
+  if (/SECRET_SCAN_TOKEN/.test(example)) {
+    fail('.env.example mentions SECRET_SCAN_TOKEN — scan mode must never look like a setting to configure')
+  } else {
+    pass('.env.example does not advertise the scan-mode bypass')
+  }
+
+  const scanModeSource = readFileSync(join(ROOT, 'lib/security/scan-mode.ts'), 'utf8')
+  if (!/APP_ORIGIN/.test(scanModeSource) || !/throw new Error/.test(scanModeSource)) {
+    fail('lib/security/scan-mode.ts no longer refuses to run against a non-local APP_ORIGIN')
+  } else {
+    pass('scan mode refuses to run unless APP_ORIGIN is local')
+  }
+}
+
+// ---------------------------------------------------------------------------
 
 async function main() {
   console.log('\nSecret-leak check\n' + '='.repeat(60))
   checkGitTracked()
   checkPublicVarNames()
   checkAdminClientIsServerOnly()
+  checkScanModeIsNotShipped()
   await checkServedResponses()
 
   for (const p of passes) console.log(`  PASS  ${p}`)

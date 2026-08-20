@@ -40,16 +40,39 @@ export async function clientIp(): Promise<string | null> {
   candidate ??= headerList.get('x-real-ip')?.trim() ?? null
   if (!candidate) return null
 
+  // Must be something Postgres's `inet` type will actually accept. The old check
+  // was a character-class filter, so values like '....' and '::::' passed here and
+  // then raised "invalid input syntax for type inet" inside the audit write -- a
+  // caller-controlled way to make the audit call throw. An address we cannot parse
+  // is recorded as null; a bad header must never be able to fail a request.
+  if (!isParseableAddress(candidate)) return null
+
   // Strip an IPv4 port suffix such as "203.0.113.4:51234".
   const withoutPort = /^\d{1,3}(\.\d{1,3}){3}:\d+$/.test(candidate)
     ? candidate.split(':')[0]!
     : candidate
 
-  return /^[0-9a-fA-F:.]+$/.test(withoutPort) ? withoutPort : null
+  return isParseableAddress(withoutPort) ? withoutPort : null
+}
+
+/** True only for something Postgres's `inet` type will accept. */
+function isParseableAddress(value: string): boolean {
+  const ipv4 = /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/
+  if (ipv4.test(value)) return true
+  // IPv6: hex groups separated by colons, with at most one '::'.
+  if (!/^[0-9a-fA-F:]+$/.test(value)) return false
+  if ((value.match(/::/g) ?? []).length > 1) return false
+  if (/:::/.test(value)) return false
+  const groups = value.split(':').filter((g) => g !== '')
+  return groups.length > 0 && groups.length <= 8 && groups.every((g) => /^[0-9a-fA-F]{1,4}$/.test(g))
 }
 
 /**
  * Appends one audit_log row.
+ *
+ * There is deliberately only ONE way to do this and it throws on failure. A
+ * non-throwing variant existed for a while, was never called, and served mainly to
+ * offer a future reader a silent-failure path out of a hard problem.
  *
  * This always goes through the service-role client, on our own server, and never
  * through the user's session. That is deliberate:
@@ -64,16 +87,6 @@ export async function clientIp(): Promise<string | null> {
  *     not from the request body. And the database independently prefers auth.uid()
  *     over the actor we pass, so impersonation is impossible even from here.
  */
-export async function recordAudit(entry: AuditEntry): Promise<void> {
-  try {
-    await writeAuditRow(entry)
-  } catch (error) {
-    // A lost audit row must never take an ordinary request down with it, but it
-    // does need to be loud in the server logs.
-    console.error('[audit] failed to record %s: %o', entry.action, error)
-  }
-}
-
 /**
  * Records an action whose audit row is part of the security control itself, not
  * merely a nice-to-have: signing in, MFA enrolment, MFA verification, switching
