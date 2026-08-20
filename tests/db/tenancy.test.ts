@@ -170,3 +170,27 @@ describe('QUALITY BAR: a cross-tenant write is rejected', () => {
     })
   })
 })
+
+describe('the RLS helper functions do not leak tenant information', () => {
+  test('Mallory cannot use a helper to turn a guessed post id into a business id', async () => {
+    await asUser(url, MALLORY, 'aal2', async (q) => {
+      const err = await expectRejected(() =>
+        q(`select app.business_of_post_for_audit($1)`, [postA]))
+      expect(err.message).toMatch(/permission denied/i)
+    })
+  })
+
+  test('the helpers Mallory CAN call answer only yes/no, and answer "no"', async () => {
+    await asUser(url, MALLORY, 'aal2', async (q) => {
+      expect((await q(`select app.may_use_post($1) as v`, [postA])).rows[0].v).toBe(false)
+      expect((await q(`select app.is_member_of($1) as v`, [businessA])).rows[0].v).toBe(false)
+    })
+  })
+
+  test('a signed-out visitor cannot execute any helper in the app schema', async () => {
+    await asAnon(url, async (q) => {
+      const err = await expectRejected(() => q(`select app.is_member_of($1)`, [businessA]))
+      expect(err.message).toMatch(/permission denied/i)
+    })
+  })
+})

@@ -162,29 +162,29 @@ create policy posts_delete_own_business on public.posts for delete to authentica
 -- You can see a scheduled post only if you are a member of the business that owns its post.
 drop policy if exists scheduled_select_own_business on public.scheduled_posts;
 create policy scheduled_select_own_business on public.scheduled_posts for select to authenticated
-  using (app.is_member_of(app.business_of_post(post_id)));
+  using (app.may_use_post(post_id));
 
 -- You may schedule a post only when both the post and the target social account belong to the same business you are a member of.
 drop policy if exists scheduled_insert_own_business on public.scheduled_posts;
 create policy scheduled_insert_own_business on public.scheduled_posts for insert to authenticated
   with check (
-    app.is_member_of(app.business_of_post(post_id))
-    and app.business_of_post(post_id) = app.business_of_social_account(social_account_id)
+    app.may_use_post(post_id)
+    and app.post_and_account_share_business(post_id, social_account_id)
   );
 
 -- You may change a scheduled post only within your own business, and it must still point at that business's post and account afterwards.
 drop policy if exists scheduled_update_own_business on public.scheduled_posts;
 create policy scheduled_update_own_business on public.scheduled_posts for update to authenticated
-  using (app.is_member_of(app.business_of_post(post_id)))
+  using (app.may_use_post(post_id))
   with check (
-    app.is_member_of(app.business_of_post(post_id))
-    and app.business_of_post(post_id) = app.business_of_social_account(social_account_id)
+    app.may_use_post(post_id)
+    and app.post_and_account_share_business(post_id, social_account_id)
   );
 
 -- You may unschedule a post only if you are a member of the business that owns it.
 drop policy if exists scheduled_delete_own_business on public.scheduled_posts;
 create policy scheduled_delete_own_business on public.scheduled_posts for delete to authenticated
-  using (app.is_member_of(app.business_of_post(post_id)));
+  using (app.may_use_post(post_id));
 
 
 -- ===========================================================================

@@ -114,3 +114,20 @@ provides a stand-in built on pgcrypto with a hardcoded key. It is labelled in ca
 at the top of the file and lives under `tests/`, never in `supabase/migrations/`.
 Migration `0008` creates the real `supabase_vault` extension and only warns if it is
 unavailable. **The shim is never applied to a real database.**
+
+### G16 — A helper function that returns an id is an enumeration oracle
+The first version of the `scheduled_posts` policy used
+`app.business_of_post(post_id)`, a `SECURITY DEFINER` function returning the owning
+business id — and it was granted to `authenticated`. Because it runs outside RLS, any
+signed-in user could hand it a post UUID and get back the id of the business that
+owns it, learning about tenants they are not a member of. Caught in review before the
+critic ran.
+
+Replaced with two boolean helpers, `app.may_use_post()` and
+`app.post_and_account_share_business()`, which answer only yes/no and so tell the
+caller nothing they were not already entitled to know. The id-returning version still
+exists as `app.business_of_post_for_audit()` for the audit trigger, granted to
+**nobody** — the trigger runs as the function owner and can call it, while no session
+can. Tests assert both the denial and the yes/no behaviour.
+
+**The general rule: a `SECURITY DEFINER` helper should return a decision, not data.**

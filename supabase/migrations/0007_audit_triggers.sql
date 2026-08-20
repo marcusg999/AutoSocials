@@ -25,7 +25,7 @@ begin
   elsif tg_table_name = 'businesses' then
     target_business := (row_snapshot ->> 'id')::uuid;
   elsif row_snapshot ? 'post_id' then
-    target_business := app.business_of_post((row_snapshot ->> 'post_id')::uuid);
+    target_business := app.business_of_post_for_audit((row_snapshot ->> 'post_id')::uuid);
   end if;
 
   if tg_op = 'UPDATE' then
