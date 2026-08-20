@@ -9,6 +9,22 @@
 import { beforeAll, afterAll, describe, expect, test } from 'vitest'
 import { asAdmin, asAnon, asUser, dropDatabase, expectRejected, freshDatabase } from './helpers'
 
+/**
+ * Every schema this project is responsible for.
+ *
+ * Written as an exclusion, not a list. Naming the schemas to scan means a table in
+ * a schema nobody thought of is invisible -- verified: a business-scoped table in a
+ * `reporting` schema was fully cross-tenant readable while every class test stayed
+ * green. The excluded set is Postgres's own catalogs plus the schemas Supabase owns
+ * and we do not control.
+ */
+const OUR_SCHEMAS = `
+  n.nspname not in ('pg_catalog', 'information_schema', 'pg_toast',
+                    'auth', 'storage', 'realtime', 'vault', 'extensions',
+                    'graphql', 'graphql_public', 'supabase_functions', 'cron', 'net')
+  and n.nspname not like 'pg_temp%' and n.nspname not like 'pg_toast_temp%'
+`
+
 const DB = 'postdeck_hardening_test'
 let url: string
 
@@ -498,7 +514,7 @@ describe('CLASS: only the intended roles can execute anything', () => {
     })
   })
 
-  test('no function in the public schema is callable by anon', async () => {
+  test('no function in any schema we own is callable by anon', async () => {
     // `public` is what PostgREST exposes as RPC. An extension installed here hands
     // every one of its functions to signed-out callers -- pgcrypto's crypt() at a
     // high bcrypt cost is a one-second-per-call CPU sink, unauthenticated.
@@ -506,7 +522,8 @@ describe('CLASS: only the intended roles can execute anything', () => {
       const r = await q(`
         select p.proname
         from pg_proc p join pg_namespace n on n.oid = p.pronamespace
-        where n.nspname = 'public' and has_function_privilege('anon', p.oid, 'EXECUTE')
+        where ${OUR_SCHEMAS} and n.nspname <> 'app'
+          and has_function_privilege('anon', p.oid, 'EXECUTE')
         order by p.proname`)
       expect(r.rows.map((x) => x.proname), 'these are reachable by a signed-out caller').toEqual([])
     })
@@ -533,7 +550,7 @@ describe('CLASS: every business-scoped table is audited', () => {
                ) as has_audit_trigger
         from pg_class c
         join pg_namespace n on n.oid = c.relnamespace
-        where n.nspname in ('public', 'app') and c.relkind in ('r', 'p')
+        where ${OUR_SCHEMAS} and c.relkind in ('r', 'p')
           -- audit_log references businesses but must never be audited: a trigger
           -- writing an audit row for every audit row does not terminate.
           and not (n.nspname = 'public' and c.relname = 'audit_log')
@@ -566,7 +583,7 @@ describe('CLASS: every table is behind row level security', () => {
         select n.nspname || '.' || c.relname as table_name,
                c.relrowsecurity, c.relforcerowsecurity
         from pg_class c join pg_namespace n on n.oid = c.relnamespace
-        where n.nspname in ('public', 'app') and c.relkind in ('r', 'p')
+        where ${OUR_SCHEMAS} and c.relkind in ('r', 'p')
           -- The migration ledger holds no tenant data and is written before any
           -- policy could exist.
           and not (n.nspname = 'public' and c.relname = 'schema_migrations')
@@ -576,6 +593,46 @@ describe('CLASS: every table is behind row level security', () => {
       for (const table of r.rows) {
         expect(table.relrowsecurity, `${table.table_name} has no row level security`).toBe(true)
         expect(table.relforcerowsecurity, `${table.table_name} does not FORCE row level security`).toBe(true)
+      }
+    })
+  })
+})
+
+describe('CLASS: a view cannot be used to read around row level security', () => {
+  test('every view reachable by a client role runs as the caller, and no materialized view is reachable at all', async () => {
+    // Views are the gap RLS does not cover. A view executes with the privileges of
+    // its OWNER unless `security_invoker = true`, which is off by default -- so a
+    // convenience view over posts hands every tenant every row, with all the
+    // underlying policies still perfectly intact. Verified directly: a plain view
+    // over public.posts returned another tenant's private body, and setting
+    // security_invoker = true returned nothing.
+    //
+    // A materialized view is worse: it stores its own copy and can never respect
+    // RLS at all, so it must not be granted to a client role under any conditions.
+    await asAdmin(url, async (q) => {
+      const r = await q(`
+        select n.nspname || '.' || c.relname            as name,
+               c.relkind::text                          as kind,
+               coalesce(array_to_string(c.reloptions, ','), '') as options,
+               has_table_privilege('anon',          c.oid, 'SELECT') as anon_select,
+               has_table_privilege('authenticated', c.oid, 'SELECT') as auth_select
+        from pg_class c join pg_namespace n on n.oid = c.relnamespace
+        where ${OUR_SCHEMAS} and c.relkind in ('v', 'm')
+        order by 1`)
+
+      for (const view of r.rows) {
+        if (view.kind === 'm') {
+          expect(view.anon_select, `${view.name} is a materialized view readable by anon`).toBe(false)
+          expect(view.auth_select, `${view.name} is a materialized view readable by authenticated; `
+            + 'it holds its own copy of the rows and cannot respect RLS').toBe(false)
+          continue
+        }
+        expect(view.anon_select, `${view.name} is readable by anon`).toBe(false)
+        if (view.auth_select) {
+          expect(view.options, `${view.name} is readable by authenticated but does not set `
+            + 'security_invoker=true, so it runs as its owner and bypasses every policy beneath it')
+            .toMatch(/security_invoker\s*=\s*(true|on)/i)
+        }
       }
     })
   })

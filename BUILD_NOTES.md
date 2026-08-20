@@ -790,6 +790,60 @@ Undoing a lockdown should never mean unlocking.
 
 ---
 
+## Gotchas found by self-review after round 6 was cut short
+
+Round 6 hit a session limit and terminated before producing any findings. Its last
+recorded step was beginning to attack the database class tests, so those attacks
+were run directly instead. **This section is self-review, not an independent
+adversarial pass, and is weaker evidence than the sections above.** The findings are
+real regardless — each was demonstrated against a live database.
+
+### G67 — A view reads straight through row level security
+The largest hole found in the schema, and one no amount of policy work would have
+closed. A Postgres view executes with the privileges of its **owner** unless
+`security_invoker = true`, which is off by default. So a convenience view over
+`posts` hands every tenant every row while all the underlying policies remain
+perfectly intact:
+
+```
+tenant B sees via view:    {"secret": "TENANT_A_PRIVATE"}
+tenant B sees via matview: {"secret": "TENANT_A_PRIVATE"}
+after `alter view ... set (security_invoker = true)`:  NOTHING
+```
+
+A materialized view is worse: it stores its own copy of the rows and can never
+respect RLS at all, so it must not be granted to a client role under any conditions.
+
+Every class test was scoped to `relkind in ('r','p')` — ordinary and partitioned
+tables — so both were invisible. There is now a test requiring that any view a
+client role can read sets `security_invoker = true`, and that no materialized view
+is readable by `anon` or `authenticated`. Verified three ways: the hostile view
+fails, the same view with `security_invoker = true` passes, the materialized view
+fails.
+
+**RLS protects tables. A view is a different object with different rules, and it is
+exactly the thing an engineer reaches for when a query gets repetitive.**
+
+### G68 — Naming the schemas to scan is the same mistake as naming the tables
+Round 5 fixed the class tests to assert by exclusion rather than by listing tables —
+and then scoped them to `nspname in ('public','app')`, which is a list. A
+business-scoped table in a `reporting` schema was fully cross-tenant readable and
+writable while every class test stayed green:
+
+```
+tenant B reads third-schema table: TENANT_A_METRIC
+schemas my class tests scan: public, app | this table is in: reporting
+```
+
+All four class tests now scan every schema **except** Postgres's own catalogs and
+the ones Supabase owns, so a schema nobody has thought of yet is covered by default.
+Verified: the same table now fails both the RLS and the audit-coverage test.
+
+**"Assert by exclusion" has to be applied at every level of the hierarchy. Fixing it
+for tables and re-introducing it for schemas one line up is not a fix.**
+
+---
+
 ## Known, accepted limitations
 
 Stated plainly rather than left to be discovered.
