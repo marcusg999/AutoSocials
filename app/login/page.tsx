@@ -8,8 +8,6 @@ const MESSAGES: Record<string, string> = {
   invalid: 'Email or password is not correct.',
   missing: 'Enter both an email address and a password.',
   signed_out: 'You have been signed out.',
-  exchange_failed: 'That sign-in link could not be used. Try again.',
-  missing_code: 'That sign-in link was incomplete. Try again.',
 }
 
 export default async function LoginPage({

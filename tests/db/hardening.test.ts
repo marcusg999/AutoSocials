@@ -247,3 +247,160 @@ describe('M2 — a cascade delete still produces an attributable audit row', () 
     })
   })
 })
+
+// ---------------------------------------------------------------------------
+// CLASS TESTS
+//
+// The tests above pin specific findings. These hunt the whole class each finding
+// belonged to, so the next instance is caught without anyone having to think of it.
+// ---------------------------------------------------------------------------
+
+describe('CLASS: no function in schema app is executable by PUBLIC', () => {
+  test('every app function has an explicit ACL', async () => {
+    // A SECURITY DEFINER function left PUBLIC-executable is an RLS bypass handed to
+    // anyone with a SQL channel. One such function was missed by hand; this checks
+    // all of them, including any a future migration adds.
+    await asAdmin(url, async (q) => {
+      const r = await q(`
+        select proname, proacl::text as acl, prosecdef
+        from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+        where n.nspname = 'app' order by proname`)
+      expect(r.rowCount).toBeGreaterThan(0)
+      for (const fn of r.rows) {
+        expect(fn.acl, `app.${fn.proname} is executable by PUBLIC`).not.toBeNull()
+      }
+    })
+  })
+
+  test('a signed-in user cannot forge audit rows via the trigger function', async () => {
+    // The concrete attack: attach app.audit_row_change to a table you control and
+    // it writes into whatever business_id your row claims, as the function owner.
+    await asUser(url, OUTSIDER, 'aal2', async (q) => {
+      await q(`create temp table forge (id uuid, business_id uuid)`)
+      const err = await expectRejected(() =>
+        q(`create trigger t after insert on forge for each row execute function app.audit_row_change()`))
+      expect(err.message).toMatch(/permission denied/i)
+    })
+  })
+})
+
+describe('CLASS: anon is granted nothing, now and for future migrations', () => {
+  test('a table created by a later migration is not granted to anon', async () => {
+    // Supabase's default privileges grant ALL on new public tables to anon. A
+    // one-time revoke fixes today's tables; the next migration reopens the hole
+    // unless the default privilege itself is cancelled.
+    await asAdmin(url, async (q) => {
+      await q(`create table public.future_phase_table (id int)`)
+      try {
+        const r = await q(`
+          select has_table_privilege('anon','public.future_phase_table','SELECT')   as sel,
+                 has_table_privilege('anon','public.future_phase_table','TRUNCATE') as trunc,
+                 has_table_privilege('anon','public.future_phase_table','DELETE')   as del`)
+        expect(r.rows[0].sel,   'anon can SELECT a new table').toBe(false)
+        expect(r.rows[0].trunc, 'anon can TRUNCATE a new table').toBe(false)
+        expect(r.rows[0].del,   'anon can DELETE from a new table').toBe(false)
+      } finally {
+        await q(`drop table public.future_phase_table`)
+      }
+    })
+  })
+})
+
+describe('CLASS: the credential reference is unwritable through every path', () => {
+  test('not on UPDATE and not on INSERT either', async () => {
+    // The first fix removed it from the UPDATE grant and left INSERT table-wide,
+    // so a brand-new row could still be pointed at another tenant's secret.
+    await asAdmin(url, async (q) => {
+      const r = await q(`
+        select has_column_privilege('authenticated','public.social_accounts','encrypted_credential_ref','INSERT') as ins,
+               has_column_privilege('authenticated','public.social_accounts','encrypted_credential_ref','UPDATE') as upd`)
+      expect(r.rows[0].ins, 'encrypted_credential_ref is insertable').toBe(false)
+      expect(r.rows[0].upd, 'encrypted_credential_ref is updatable').toBe(false)
+    })
+  })
+
+  test('inserting a row that names another tenant\'s secret is refused', async () => {
+    await asUser(url, OUTSIDER, 'aal2', async (q) => {
+      const err = await expectRejected(() =>
+        q(`insert into public.social_accounts (business_id, platform, label, encrypted_credential_ref)
+           values ($1,'instagram','Stolen',$2)`,
+          [businessB, 'social_account_' + accountA.replace(/-/g, '')]))
+      expect(err.message).toMatch(/permission denied/i)
+    })
+  })
+
+  test('nor one naming the platform-wide provider key', async () => {
+    await asUser(url, OUTSIDER, 'aal2', async (q) => {
+      const err = await expectRejected(() =>
+        q(`insert into public.social_accounts (business_id, platform, label, encrypted_credential_ref)
+           values ($1,'instagram','Stolen','meta_app_secret')`, [businessB]))
+      expect(err.message).toMatch(/permission denied/i)
+    })
+  })
+})
+
+describe('CLASS: every helper granted to authenticated refuses an aal1 session', () => {
+  test.each([
+    ['is_member_of',        `select app.is_member_of($1) as v`],
+    ['has_role_in',         `select app.has_role_in($1, array['owner']::public.member_role[]) as v`],
+  ])('%s answers false without TOTP, even for a genuine member', async (_name, sql) => {
+    // The RESTRICTIVE MFA policy guards tables. These functions are reachable
+    // independently of any table, so each carries the check itself.
+    await asUser(url, OWNER, 'aal1', async (q) => {
+      expect((await q(sql, [businessA])).rows[0].v).toBe(false)
+    })
+    await asUser(url, OWNER, 'aal2', async (q) => {
+      expect((await q(sql, [businessA])).rows[0].v).toBe(true)
+    })
+  })
+
+  test('post_belongs_to and account_belongs_to do not confirm other tenants\' relationships', async () => {
+    // Taking the business id as an argument turned a lookup oracle into a
+    // confirmation oracle. Scoping to the caller's memberships removes it.
+    await asUser(url, OUTSIDER, 'aal2', async (q) => {
+      expect((await q(`select app.account_belongs_to($1,$2) as v`, [accountA, businessA])).rows[0].v).toBe(false)
+    })
+    await asUser(url, OWNER, 'aal1', async (q) => {
+      expect((await q(`select app.account_belongs_to($1,$2) as v`, [accountA, businessA])).rows[0].v).toBe(false)
+    })
+    await asUser(url, OWNER, 'aal2', async (q) => {
+      expect((await q(`select app.account_belongs_to($1,$2) as v`, [accountA, businessA])).rows[0].v).toBe(true)
+    })
+  })
+})
+
+describe('the Vault write path is audited, including a rotation', () => {
+  test('storing and rotating a credential each write a meaningful audit row', async () => {
+    const before = await asAdmin(url, async (q) => (await q(`select coalesce(max(id),0) m from public.audit_log`)).rows[0].m)
+    await asAdmin(url, async (q) => {
+      await q(`select app.store_account_credential($1,'ROTATED-TOKEN-V2')`, [accountA])
+    })
+    const rows = await asAdmin(url, async (q) =>
+      (await q(`select * from public.audit_log where id > $1 order by id`, [before])).rows)
+
+    const credentialRow = rows.find((r) => String(r.action).startsWith('social_account.credential.'))
+    expect(credentialRow, 'a credential write must be audited').toBeTruthy()
+    expect(credentialRow.action).toBe('social_account.credential.rotated')
+    expect(credentialRow.business_id).toBe(businessA)
+    // And it must never contain the credential itself.
+    expect(JSON.stringify(credentialRow)).not.toContain('ROTATED-TOKEN-V2')
+  })
+
+  test('storing against an unknown account is refused rather than silently unaudited', async () => {
+    await asAdmin(url, async (q) => {
+      const err = await expectRejected(() =>
+        q(`select app.store_account_credential('99999999-9999-9999-9999-999999999999','SECRET')`))
+      expect(err.message).toMatch(/no such social account/i)
+    })
+  })
+})
+
+test('authorship cannot be erased', async () => {
+  await asUser(url, OWNER, 'aal2', async (q) => {
+    const id = (await q(`insert into public.posts (business_id, created_by, body) values ($1,$2,'{}') returning id`,
+      [businessA, OWNER])).rows[0].id
+    const err = await expectRejected(() =>
+      q(`update public.posts set created_by = null where id = $1`, [id]))
+    expect(err.message).toMatch(/row-level security/i)
+  })
+})

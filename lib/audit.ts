@@ -51,25 +51,41 @@ export async function clientIp(): Promise<string | null> {
  */
 export async function recordAudit(entry: AuditEntry): Promise<void> {
   try {
-    const supabase = createSupabaseAdminClient()
-    const { error } = await supabase.schema('app').rpc('write_audit', {
-      p_action: entry.action,
-      p_business_id: entry.businessId ?? null,
-      p_target_type: entry.targetType ?? null,
-      p_target_id: entry.targetId ?? null,
-      p_metadata: entry.metadata ?? {},
-      p_ip: await clientIp(),
-      p_actor_user_id: entry.actorUserId ?? null,
-    })
-
-    if (error) {
-      // A lost audit row must never take a user-facing request down with it, but
-      // it does need to be loud in the server logs.
-      console.error('[audit] failed to record %s: %s', entry.action, error.message)
-    }
+    await writeAuditRow(entry)
   } catch (error) {
+    // A lost audit row must never take an ordinary request down with it, but it
+    // does need to be loud in the server logs.
     console.error('[audit] failed to record %s: %o', entry.action, error)
   }
+}
+
+/**
+ * Records an action whose audit row is part of the security control itself, not
+ * merely a nice-to-have: signing in, MFA enrolment, MFA verification, switching
+ * business. If the row cannot be written the action FAILS.
+ *
+ * The trade is deliberate. Everywhere else a dropped audit row costs visibility;
+ * here it would mean an authentication event happened with no record of it, which
+ * is precisely the event an attacker most wants unlogged. "Every mutating action
+ * writes an audit row" has to mean writes, not attempts.
+ */
+export async function recordAuditOrThrow(entry: AuditEntry): Promise<void> {
+  await writeAuditRow(entry)
+}
+
+async function writeAuditRow(entry: AuditEntry): Promise<void> {
+  const supabase = createSupabaseAdminClient()
+  const { error } = await supabase.schema('app').rpc('write_audit', {
+    p_action: entry.action,
+    p_business_id: entry.businessId ?? null,
+    p_target_type: entry.targetType ?? null,
+    p_target_id: entry.targetId ?? null,
+    p_metadata: entry.metadata ?? {},
+    p_ip: await clientIp(),
+    p_actor_user_id: entry.actorUserId ?? null,
+  })
+
+  if (error) throw new Error(`could not write audit row for ${entry.action}: ${error.message}`)
 }
 
 /**
@@ -78,5 +94,5 @@ export async function recordAudit(entry: AuditEntry): Promise<void> {
  * or null if the account does not exist.
  */
 export async function recordAnonymousAudit(entry: AuditEntry): Promise<void> {
-  await recordAudit(entry)
+  await recordAuditOrThrow(entry)
 }

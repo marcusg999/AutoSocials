@@ -112,7 +112,7 @@ function checkAdminClientIsServerOnly() {
 const CANARIES = {
   SUPABASE_SERVICE_ROLE_KEY: 'CANARY_SERVICE_ROLE_a1b2c3d4e5f6a7b8',
   SUPABASE_DB_PASSWORD: 'CANARY_DB_PASSWORD_9f8e7d6c5b4a3928',
-  CSRF_SIGNING_SECRET: 'CANARY_CSRF_SECRET_5a4b3c2d1e0f9887',
+  CSRF_SIGNING_SECRET: 'CANARY_CSRF_SECRET_5a4b3c2d1e0f9887_at_least_32_chars',
 } as const
 
 function checkBuiltBundle() {
@@ -121,6 +121,7 @@ function checkBuiltBundle() {
     ...CANARIES,
     NEXT_PUBLIC_SUPABASE_URL: process.env.NEXT_PUBLIC_SUPABASE_URL ?? 'https://example.supabase.co',
     NEXT_PUBLIC_SUPABASE_ANON_KEY: process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? 'public-anon-key-safe-to-ship',
+    APP_ORIGIN: process.env.APP_ORIGIN ?? 'https://postdeck.example.com',
     NEXT_TELEMETRY_DISABLED: '1',
   }
 
@@ -133,9 +134,16 @@ function checkBuiltBundle() {
     return
   }
 
-  // Everything the browser can download: the static chunk directory.
-  const clientFiles = walk(join(ROOT, '.next/static'))
-  if (!clientFiles.length) { fail('.next/static is empty — nothing was scanned'); return }
+  // Everything the browser can receive. That is more than the JS chunks: a server
+  // component that accidentally passes a secret as a prop serialises it into the
+  // RSC flight payload embedded in the prerendered HTML, which .next/static does
+  // not contain. Both are scanned.
+  const chunkFiles = walk(join(ROOT, '.next/static'))
+  const renderedFiles = walk(join(ROOT, '.next/server/app'))
+    .filter((f) => /\.(html|rsc|body)$/.test(f))
+  const clientFiles = [...chunkFiles, ...renderedFiles]
+
+  if (!chunkFiles.length) { fail('.next/static is empty — nothing was scanned'); return }
 
   const found: string[] = []
   for (const file of clientFiles) {
@@ -149,7 +157,8 @@ function checkBuiltBundle() {
   }
 
   if (found.length) fail(`SECRETS FOUND IN THE CLIENT BUNDLE:\n    ${found.join('\n    ')}`)
-  else pass(`no server-only secret appears in any of ${clientFiles.length} client bundle files`)
+  else pass(`no server-only secret appears in any of ${clientFiles.length} browser-reachable files `
+    + `(${chunkFiles.length} JS chunks, ${renderedFiles.length} prerendered/RSC payloads)`)
 }
 
 // ---------------------------------------------------------------------------

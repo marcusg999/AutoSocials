@@ -46,9 +46,21 @@ security definer
 set search_path = ''
 as $$
 declare
-  secret_name text;
-  existing_id uuid;
+  secret_name     text;
+  existing_id     uuid;
+  target_business uuid;
+  is_rotation     boolean;
 begin
+  -- Refuse an id that is not a real social account. Without this a typo silently
+  -- writes a credential into the Vault attached to nothing, and the UPDATE below
+  -- matches no row, so the audit trigger never fires and nothing is recorded.
+  select business_id into target_business
+    from public.social_accounts where id = target_account_id;
+  if target_business is null then
+    raise exception 'no such social account: %', target_account_id
+      using errcode = 'no_data_found';
+  end if;
+
   secret_name := app.credential_name_for(target_account_id);
 
   select id into existing_id from vault.secrets where name = secret_name;
@@ -60,9 +72,28 @@ begin
     perform vault.update_secret(existing_id, credential);
   end if;
 
+  is_rotation := exists (
+    select 1 from public.social_accounts
+    where id = target_account_id and encrypted_credential_ref = secret_name
+  );
+
   update public.social_accounts
      set encrypted_credential_ref = secret_name
    where id = target_account_id;
+
+  -- Audited explicitly rather than left to the row trigger. Rotating a credential
+  -- changes no column on the row, so the trigger would record
+  -- `changed_columns: []` -- a permanent record saying nothing happened, for the
+  -- single most sensitive operation in the system.
+  perform app.write_audit(
+    p_action      => case when is_rotation
+                          then 'social_account.credential.rotated'
+                          else 'social_account.credential.stored' end,
+    p_business_id => target_business,
+    p_target_type => 'social_accounts',
+    p_target_id   => target_account_id::text,
+    p_metadata    => jsonb_build_object('secret_name', secret_name)
+  );
 
   return secret_name;
 end;

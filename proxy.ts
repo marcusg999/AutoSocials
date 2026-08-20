@@ -16,7 +16,6 @@ import { NextResponse, type NextRequest } from 'next/server'
 import { updateSession } from '@/lib/supabase/proxy'
 import { attachCsrfCookie, issueCsrfToken } from '@/lib/security/csrf-token'
 import {
-  AUTH_CALLBACK_PATH,
   DASHBOARD_PATH,
   LOGIN_PATH,
   MFA_ENROLL_PATH,
@@ -61,8 +60,6 @@ function destinationFor(
   // nextLevel of aal2 while currentLevel is aal1 means: a verified factor exists,
   // it just has not been challenged on this session yet.
   const mfaStep = nextLevel === 'aal2' ? MFA_VERIFY_PATH : MFA_ENROLL_PATH
-
-  if (pathname === AUTH_CALLBACK_PATH) return null
 
   if (isPublicPath(pathname)) {
     if (fullyVerified) return DASHBOARD_PATH

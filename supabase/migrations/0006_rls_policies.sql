@@ -20,19 +20,29 @@
 revoke all on all tables    in schema public from anon, authenticated;
 revoke all on all sequences in schema public from anon, authenticated;
 
+-- And cancel the rule going forward, not just for the tables that exist right now.
+-- Without these two lines the very next migration anyone writes creates a table
+-- that is once again fully granted to `anon`, TRUNCATE included, and the hole
+-- above reopens silently.
+alter default privileges in schema public revoke all on tables    from anon, authenticated;
+alter default privileges in schema public revoke all on sequences from anon, authenticated;
+
 -- `anon` is granted nothing at all: a signed-out visitor cannot touch any table.
 grant select, insert, update, delete on public.businesses        to authenticated;
 grant select, insert, update, delete on public.business_members  to authenticated;
-grant select, insert, delete         on public.social_accounts   to authenticated;
+grant select, delete                 on public.social_accounts   to authenticated;
 grant select, insert, update, delete on public.posts             to authenticated;
 grant select, insert, update, delete on public.scheduled_posts   to authenticated;
 grant select                          on public.audit_log        to authenticated;
 
--- social_accounts is granted UPDATE column by column, deliberately EXCLUDING
--- encrypted_credential_ref. That column names a secret in the Vault; if a tenant
--- could edit it they could point their own row at another tenant's secret and have
--- the publisher use it on their behalf. Only the server may set it, via
+-- social_accounts is granted INSERT and UPDATE column by column, deliberately
+-- EXCLUDING encrypted_credential_ref from BOTH. That column names a secret in the
+-- Vault; if a tenant could set it -- on a new row just as easily as on an existing
+-- one -- they could point their own row at another tenant's secret and have the
+-- publisher use it on their behalf. Only the server may set it, via
 -- app.store_account_credential().
+grant insert (business_id, platform, label, provider, provider_account_ref, status, connected_at)
+  on public.social_accounts to authenticated;
 grant update (label, provider, provider_account_ref, status, connected_at)
   on public.social_accounts to authenticated;
 
@@ -174,7 +184,9 @@ create policy posts_update_own_business on public.posts for update to authentica
   using      (app.has_role_in(business_id, array['owner','manager']::public.member_role[]))
   with check (
     app.has_role_in(business_id, array['owner','manager']::public.member_role[])
-    and (created_by is null or created_by = (select auth.uid()))
+    -- Not "null or self": allowing null would let an owner erase authorship, and
+    -- the audit row records which column changed but never its old value.
+    and created_by = (select auth.uid())
   );
 
 -- Only an owner or manager may delete a post.

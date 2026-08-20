@@ -4,7 +4,7 @@ import { redirect } from 'next/navigation'
 
 import { assertCsrf } from '@/lib/security/csrf'
 import { requireSignedInUserOrThrow } from '@/lib/security/session'
-import { recordAudit } from '@/lib/audit'
+import { recordAuditOrThrow } from '@/lib/audit'
 import { DASHBOARD_PATH, MFA_VERIFY_PATH } from '@/lib/security/routes'
 
 const SIX_DIGITS = /^\d{6}$/
@@ -35,7 +35,7 @@ export async function verifyFactorAction(formData: FormData): Promise<void> {
   })
 
   if (verifyError) {
-    await recordAudit({
+    await recordAuditOrThrow({
       action: 'auth.mfa.verify.failure',
       targetType: 'mfa_factor',
       targetId: factorId,
@@ -45,7 +45,7 @@ export async function verifyFactorAction(formData: FormData): Promise<void> {
     redirect(`${MFA_VERIFY_PATH}?error=invalid_code`)
   }
 
-  await recordAudit({
+  await recordAuditOrThrow({
     action: 'auth.mfa.verify',
     targetType: 'mfa_factor',
     targetId: factorId,

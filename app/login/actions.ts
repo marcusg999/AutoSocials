@@ -2,9 +2,9 @@
 
 import { redirect } from 'next/navigation'
 
-import { assertCsrf } from '@/lib/security/csrf'
+import { assertCsrf, rotateCsrfToken } from '@/lib/security/csrf'
 import { createSupabaseServerClient } from '@/lib/supabase/server'
-import { recordAnonymousAudit, recordAudit } from '@/lib/audit'
+import { recordAnonymousAudit, recordAuditOrThrow } from '@/lib/audit'
 import {
   DASHBOARD_PATH,
   LOGIN_PATH,
@@ -36,9 +36,13 @@ export async function signInAction(formData: FormData): Promise<void> {
     redirect(`${LOGIN_PATH}?error=invalid`)
   }
 
+  // A new session gets a new CSRF token, so one minted before sign-in -- possibly
+  // by somebody else -- can never be replayed across the boundary.
+  await rotateCsrfToken()
+
   // The user id comes from the session we just established, not from the form.
   const { data: signedIn } = await supabase.auth.getUser()
-  await recordAudit({ action: 'auth.login.success', actorUserId: signedIn.user?.id ?? null })
+  await recordAuditOrThrow({ action: 'auth.login.success', actorUserId: signedIn.user?.id ?? null })
 
   // A password is only the first factor; where to go next depends on MFA state.
   const { data: aal } = await supabase.auth.mfa.getAuthenticatorAssuranceLevel()

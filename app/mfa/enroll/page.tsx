@@ -5,7 +5,7 @@ import { resolveSessionState } from '@/lib/security/session'
 import { DASHBOARD_PATH, LOGIN_PATH, MFA_VERIFY_PATH } from '@/lib/security/routes'
 import { signOutAction } from '@/app/actions'
 
-import { confirmEnrollmentAction } from './actions'
+import { confirmEnrollmentAction, restartEnrollmentAction } from './actions'
 
 export const dynamic = 'force-dynamic'
 
@@ -31,17 +31,26 @@ export default async function EnrollPage({
   const { error } = await searchParams
   const message = error ? MESSAGES[error] ?? 'Enrolment could not be completed.' : null
 
-  // Discard any half-finished enrolment so a user cannot accumulate dead factors.
+  // A GET must not mutate. SameSite=Lax sends session cookies on top-level
+  // cross-site navigation, so if rendering this page discarded and recreated the
+  // user's pending factor, any website could churn it just by linking here.
+  //
+  // So: start an enrolment only when there is not one already. If a pending factor
+  // exists we cannot show its QR again -- Supabase returns the QR once, at
+  // creation -- so the page offers a "start over" button instead, which is a POST
+  // and therefore CSRF-protected.
   const { data: existing } = await supabase.auth.mfa.listFactors()
-  for (const factor of existing?.all ?? []) {
-    if (factor.factor_type === 'totp' && factor.status === 'unverified') {
-      await supabase.auth.mfa.unenroll({ factorId: factor.id })
-    }
-  }
+  const pending = existing?.all?.find(
+    (factor) => factor.factor_type === 'totp' && factor.status === 'unverified',
+  )
 
-  const { data: enrolled, error: enrollError } = await supabase.auth.mfa.enroll({ factorType: 'totp' })
+  const { data: enrolled, error: enrollError } = pending
+    ? { data: null, error: null }
+    : await supabase.auth.mfa.enroll({ factorType: 'totp' })
 
-  if (enrollError || !enrolled) {
+  const factorId = enrolled?.id ?? pending?.id
+
+  if (enrollError || !factorId) {
     return (
       <main className="shell narrow">
         <p className="brand">PostDeck</p>
@@ -64,18 +73,34 @@ export default async function EnrollPage({
 
       {message ? <p className="alert">{message}</p> : null}
 
-      <div className="panel">
-        <p>1. Scan this code with your authenticator app.</p>
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img className="qr" src={enrolled.totp.qr_code} alt="TOTP enrolment QR code" />
-        <p className="muted" style={{ marginTop: 12 }}>
-          Cannot scan? Enter this key by hand: <span className="secret">{enrolled.totp.secret}</span>
-        </p>
-      </div>
+      {enrolled ? (
+        <div className="panel">
+          <p>1. Scan this code with your authenticator app.</p>
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img className="qr" src={enrolled.totp.qr_code} alt="TOTP enrolment QR code" />
+          <p className="muted" style={{ marginTop: 12 }}>
+            Cannot scan? Enter this key by hand:{' '}
+            <span className="secret">{enrolled.totp.secret}</span>
+          </p>
+        </div>
+      ) : (
+        <div className="panel">
+          <p>
+            You already started setting this up. Enter the six-digit code from your authenticator
+            app below.
+          </p>
+          <form action={restartEnrollmentAction}>
+            {await csrfField()}
+            <button type="submit" className="secondary">
+              Lost it? Start over with a new QR code
+            </button>
+          </form>
+        </div>
+      )}
 
       <form action={confirmEnrollmentAction} className="panel">
         {await csrfField()}
-        <input type="hidden" name="factorId" value={enrolled.id} />
+        <input type="hidden" name="factorId" value={factorId} />
         <div className="field">
           <label htmlFor="code">2. Enter the six-digit code</label>
           <input

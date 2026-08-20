@@ -5,7 +5,7 @@ import { revalidatePath } from 'next/cache'
 
 import { assertCsrf } from '@/lib/security/csrf'
 import { requireMfaSessionOrThrow } from '@/lib/security/session'
-import { recordAudit } from '@/lib/audit'
+import { recordAuditOrThrow } from '@/lib/audit'
 import { ACTIVE_BUSINESS_COOKIE, UUID_PATTERN, activeBusinessCookieOptions } from '@/lib/business'
 import { DASHBOARD_PATH } from '@/lib/security/routes'
 
@@ -30,7 +30,7 @@ export async function switchBusinessAction(formData: FormData): Promise<void> {
   const cookieStore = await cookies()
   cookieStore.set(ACTIVE_BUSINESS_COOKIE, businessId, activeBusinessCookieOptions())
 
-  await recordAudit({
+  await recordAuditOrThrow({
     action: 'business.switch',
     businessId,
     targetType: 'business',

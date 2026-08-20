@@ -272,6 +272,125 @@ sequence is granted to anyone now.
 
 ---
 
+## Gotchas found by the second adversarial review
+
+A second reviewer, fresh context, attacked the whole stack after round 1's fixes.
+It failed criterion 4 outright and found that round 1 had fixed the *instances* it
+was shown rather than the *classes* they belonged to. That judgement was correct and
+is the most useful thing either review produced.
+
+Every fix below is now pinned by a **class test** — one that enumerates every
+member of the category rather than checking the specific case that was reported.
+
+### G26 — The same column, a different verb
+Round 1 removed `encrypted_credential_ref` from the UPDATE grant. The INSERT grant
+was still table-wide, so a **new** row could be created pointing at another tenant's
+Vault secret — the identical attack through the other verb. The regression test was
+titled *"not writable by a signed-in user at all"* and only exercised UPDATE: the
+test name asserted more than the test did.
+
+Both grants are now column-scoped, and the class test asks Postgres directly whether
+the column is writable by `authenticated` through INSERT *or* UPDATE.
+
+**If a test's name is broader than its body, the name is a lie that will be believed.**
+
+### G27 — CSRF: two half-measures that cancelled out
+Two defects that were individually survivable and together fatal:
+
+- **The origin check consulted the request.** It compared `Origin` against
+  `x-forwarded-host` — a header the client sends. The rule was effectively "Origin
+  must match whatever host this request claims to be for", which any attacker
+  satisfies by sending both. Now compared against a configured `APP_ORIGIN`
+  allowlist, which fails closed if unset in production. `next.config.ts` names the
+  same origins for Next's own Server Action check, which had the same weakness.
+- **The token was unsigned.** `assertCsrf` only checked cookie == field, so any
+  value an attacker could plant satisfied it, being both halves. The token is now
+  `nonce.expiry.HMAC`, so the server verifies it minted it; an unsigned cookie is
+  *replaced* rather than trusted, and the token is rotated at sign-in and cleared at
+  sign-out.
+
+The tests had two describe blocks, `'the token itself'` and `'the cookie'` — and
+never once called `assertCsrf`. **The checking code, not the token, is where CSRF
+bugs live.**
+
+### G28 — The one function nobody revoked
+Every function in schema `app` carried an explicit `revoke ... from public` except
+`app.audit_row_change()`, which was left PUBLIC-executable. Being SECURITY DEFINER,
+a user could attach it to a temp table of their own and forge permanent, undeletable
+rows into any tenant's audit trail.
+
+A uniform pattern applied by hand will eventually miss one member. The class test now
+enumerates `pg_proc` for schema `app` and fails if **any** function has a null ACL.
+
+### G29 — A one-time revoke against a standing rule
+Round 1 revoked `anon`'s privileges on the tables that existed *at that moment*. The
+Supabase default-privilege rule that granted them was still in force, so the very
+next migration would create a table granted to `anon` all over again — TRUNCATE
+included. `alter default privileges ... revoke all` now cancels the rule itself, and
+the class test creates a table and checks `anon` gets nothing.
+
+**Revoking a privilege is not the same as revoking the rule that grants it.**
+
+### G30 — The audit log had no second layer
+The sharpest finding. Everything else in this design has depth: tenancy has RLS *and*
+FORCE *and* column grants; auth has the proxy *and* `requireMfaSession()` *and* a
+restrictive policy. The audit log had none — append-only so a bad row is permanent,
+best-effort so a good row was optional, forgeable via G28, and blind to the one
+operation that touches a real credential.
+
+Fixed on four fronts: `recordAuditOrThrow` makes the row mandatory for
+authentication events and business switching (a dropped row there is exactly the
+event an attacker wants unlogged); `store_account_credential` validates its account
+id and writes an explicit audit row, distinguishing a first store from a rotation;
+`audit_row_change` is revoked from PUBLIC; and the code-exchange route is gone.
+
+### G31 — Rotating a credential recorded that nothing changed
+`store_account_credential` relied on its `UPDATE social_accounts` firing the row
+trigger. Rotating a credential writes the same reference back, so no column changed
+and the audit row read `changed_columns: []` — a permanent record saying nothing
+happened, for the most sensitive operation in the system. Worse, storing against an
+unknown account id updated no row at all, so a secret entered the Vault with **no**
+audit row. It now validates the id and audits explicitly.
+
+### G32 — Deleting an endpoint beats hardening it
+`/auth/callback` exchanged an attacker-supplied `code` query parameter for a session,
+with no `state` validation, no audit row, and — by necessity — placement outside every
+auth guard. Phase 1 signs in with email and password only; nothing linked to it.
+
+It was deleted rather than fixed. A test now asserts no route handler calls
+`exchangeCodeForSession`, so it cannot reappear without a deliberate decision.
+**The most reliable way to secure an endpoint you are not using is not to ship it.**
+
+### G33 — A GET that mutates
+Rendering the MFA enrol page unenrolled and recreated the user's pending factor —
+two writes on a plain GET, with no CSRF token. `SameSite=Lax` sends session cookies
+on top-level cross-site navigation, so any website could churn a victim's pending
+enrolment by linking to the page. The page now starts an enrolment only when there
+is not one already, and "start over" is a CSRF-protected POST.
+
+### G34 — The action was weaker than the page it belonged to
+`app/mfa/enroll/page.tsx` redirected a user who already had a verified factor;
+`confirmEnrollmentAction` did not, and validated the submitted factor against
+`factors.all`, which includes unverified ones. So the *page* refused "enrol a second
+factor while holding an unchallenged first one" and the *action* did not — the
+textbook MFA bypass, stopped only by GoTrue's own policy. A guard on the page that is
+missing from its action is not a guard.
+
+### G35 — The class of "the tests match the fixes"
+Stated plainly because it is the lesson, not an incident: after round 1 the suite was
+137 green tests that covered the RLS matrix thoroughly and the application security
+layer barely at all. No test imported `lib/security/session.ts`, any server action,
+or checked a single function ACL. Tests written in response to findings will always
+be shaped like those findings.
+
+The suite now includes structural tests that enumerate rather than sample: every
+server action must call `assertCsrf` first and establish its own session; every page
+must call `requireMfaSession()` or appear on a short, justified list whose members
+are separately checked for making no database call at all. These catch the action
+somebody adds next year, which no hand-written per-route test can.
+
+---
+
 ## Known, accepted limitations
 
 Stated plainly rather than left to be discovered.
@@ -283,20 +402,24 @@ Stated plainly rather than left to be discovered.
    untested surface in the phase.
 2. **The Vault used in tests is a pgcrypto stand-in**, not the real Supabase Vault.
    Call shapes match; the encryption does not.
-3. **Audit writes are best-effort.** A failed audit write is logged and does not fail
-   the user's request. That is a deliberate availability choice, but it means audit
-   coverage is guaranteed for anything the database triggers see and best-effort for
-   app-level events such as login.
+3. **Audit writes are best-effort for ordinary actions, mandatory for security
+   events.** `recordAuditOrThrow` fails the request if the row cannot be written, and
+   is used for sign-in, sign-out, MFA enrol/verify and business switching.
+   `recordAudit` logs and continues, and is used where losing a row costs visibility
+   rather than accountability. Row changes are recorded by database triggers, so they
+   cannot be lost this way at all.
 4. **Failed-login audit rows record the attempted email address.** Deliberate — you
    cannot spot credential stuffing without it — but it is personal data in a table
    that by design can never be deleted.
 5. **A user removed from a business keeps read access to their own historical audit
    rows** in that business, via the `actor_user_id = auth.uid()` branch of
    `audit_select_own`.
-6. **`assertCsrf` trusts `x-forwarded-host` over `host`**, matching Next.js's own
-   server-action origin check. This assumes deployment behind a proxy that
-   overwrites that header. The synchroniser token, not the origin check, is the real
-   defence.
-7. **MFA enrolment issues a fresh factor on each render of the enrol page**, so a
-   mistyped code means rescanning the QR code. Fixing this properly needs either
-   client-side form state or a persisted pending factor.
+6. **`APP_ORIGIN` must be set in production.** CSRF and Next's Server Action origin
+   check both compare against it. If it is unset, every mutation fails closed —
+   deliberately, since the alternative is trusting a client-supplied header.
+7. **The CSRF token is signed but not bound to a session id.** It is rotated at
+   sign-in and cleared at sign-out, which closes fixation across a session boundary,
+   but a token is not cryptographically tied to the user holding it.
+8. **`app.write_audit` accepts a caller-supplied action string.** A trusted
+   server-side caller could record an action that did not happen. Only `service_role`
+   can reach it, so this is a compromised-server scenario, not a tenant one.

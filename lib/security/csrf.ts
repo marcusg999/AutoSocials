@@ -13,6 +13,22 @@ import {
 
 export { CSRF_COOKIE_NAME, CSRF_FIELD_NAME }
 
+/**
+ * Issues a brand-new CSRF token. Called after a successful sign-in and after
+ * signing out, so a token minted before the session changed can never be reused
+ * across it.
+ */
+export async function rotateCsrfToken(): Promise<void> {
+  const cookieStore = await cookies()
+  cookieStore.set(CSRF_COOKIE_NAME, createCsrfToken(), csrfCookieOptions())
+}
+
+/** Removes the token entirely, on sign-out. */
+export async function clearCsrfToken(): Promise<void> {
+  const cookieStore = await cookies()
+  cookieStore.delete(CSRF_COOKIE_NAME)
+}
+
 export class CsrfError extends Error {
   constructor(reason: string) {
     super(`CSRF check failed: ${reason}`)
@@ -45,11 +61,12 @@ export async function csrfField() {
 }
 
 /**
- * Rejects the request unless it came from our own origin AND carries the
- * synchroniser token that matches the httpOnly cookie.
+ * Rejects the request unless it came from one of our own origins AND carries a
+ * server-signed token matching the httpOnly cookie.
  *
- * Origin/Referer alone is spoofable by non-browser clients and absent on some
- * requests, so the token is what actually makes forgery impossible.
+ * Two independent checks, because each covers the other's gap: the Origin header
+ * is absent on some legitimate requests and spoofable by non-browser clients, and
+ * the token alone would not stop a same-origin script. Both must pass.
  */
 export async function assertCsrf(formData: FormData): Promise<void> {
   await assertSameOrigin()
@@ -65,23 +82,59 @@ export async function assertCsrf(formData: FormData): Promise<void> {
   if (!csrfTokensMatch(expected, provided)) throw new CsrfError('token mismatch')
 }
 
-/** The allowlist is exactly one entry: the host this request was addressed to. */
+/**
+ * Rejects anything whose Origin is not one of ours.
+ *
+ * The allowlist comes from configuration, NOT from the request. An earlier version
+ * compared Origin against `x-forwarded-host` -- a header the client supplies -- so
+ * the rule was really "Origin must match whatever host the request claims to be
+ * for", which any attacker can satisfy by sending both.
+ */
 async function assertSameOrigin(): Promise<void> {
   const headerList = await headers()
-  const host = headerList.get('x-forwarded-host') ?? headerList.get('host')
-  if (!host) throw new CsrfError('request has no Host header')
 
   const stated = headerList.get('origin') ?? headerList.get('referer')
   if (!stated) throw new CsrfError('request states neither Origin nor Referer')
 
-  let statedHost: string
+  let statedOrigin: string
   try {
-    statedHost = new URL(stated).host
+    statedOrigin = new URL(stated).origin
   } catch {
     throw new CsrfError('request states an unparseable Origin/Referer')
   }
 
-  if (statedHost !== host) {
-    throw new CsrfError(`cross-origin submission from ${statedHost}`)
+  const allowed = allowedOrigins(headerList)
+  if (!allowed.includes(statedOrigin)) {
+    throw new CsrfError(`cross-origin submission from ${statedOrigin}`)
   }
+}
+
+/**
+ * In production the allowlist is exactly what APP_ORIGIN says, and nothing else.
+ * Only in development does it fall back to the request's own host, so that
+ * localhost and preview ports work without configuration.
+ */
+function allowedOrigins(headerList: Headers): string[] {
+  const configured = (process.env.APP_ORIGIN ?? '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .map((value) => {
+      try {
+        return new URL(value).origin
+      } catch {
+        throw new CsrfError(`APP_ORIGIN contains an unparseable value: ${value}`)
+      }
+    })
+
+  if (process.env.NODE_ENV === 'production') {
+    if (configured.length === 0) {
+      throw new CsrfError('APP_ORIGIN must be set in production so cross-origin posts can be refused')
+    }
+    return configured
+  }
+
+  const host = headerList.get('host')
+  const development = host ? [`http://${host}`, `https://${host}`] : []
+  return [...configured, ...development]
 }

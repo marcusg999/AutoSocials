@@ -69,3 +69,9 @@ begin
       audited_table);
   end loop;
 end $$;
+
+-- Every function in schema `app` is revoked from PUBLIC. This one especially:
+-- it is SECURITY DEFINER and calls app.write_audit as the owner, so a user who
+-- could execute it could attach it to a table of their own and forge permanent,
+-- undeletable rows into any tenant's audit trail.
+revoke all on function app.audit_row_change() from public;
