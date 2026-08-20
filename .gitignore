@@ -9,3 +9,5 @@ build/
 .env
 .env.*
 !.env.example
+tsconfig.tsbuildinfo
+next-env.d.ts

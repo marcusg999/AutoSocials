@@ -50,7 +50,12 @@ function checkGitTracked() {
     if (!m) return false
     const value = m[2].trim().replace(/^["']|["']$/g, '')
     if (!value) return false
-    const looksLikePlaceholder = /^(<.*>|your[-_]|replace|placeholder|example|changeme|xxx|\.\.\.|http:\/\/127|http:\/\/localhost|https:\/\/your)/i.test(value)
+    // A value is acceptable only if it is obviously a stand-in: an angle-bracket
+    // hint, a "your-..." name, or a local-only connection string.
+    const looksLikePlaceholder =
+      /^(<.*>|your[-_]|replace|placeholder|example|changeme|xxx|\.\.\.)/i.test(value) ||
+      /^https:\/\/your/i.test(value) ||
+      /(localhost|127\.0\.0\.1)/.test(value)
     const looksLikeRealKey = /^(eyJ|sb_|sk-|sbp_)/.test(value) || value.length > 60
     return looksLikeRealKey || !looksLikePlaceholder
   })

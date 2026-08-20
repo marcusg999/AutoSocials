@@ -131,3 +131,18 @@ exists as `app.business_of_post_for_audit()` for the audit trigger, granted to
 can. Tests assert both the denial and the yes/no behaviour.
 
 **The general rule: a `SECURITY DEFINER` helper should return a decision, not data.**
+
+### G17 — `middleware-manifest.json` is empty on every Next 16 Turbopack build
+Verifying that `proxy.ts` is actually registered by reading
+`.next/server/middleware-manifest.json` gives `{"middleware": {}, "sortedMiddleware": []}`
+and a 221-byte stub `middleware.js` — which looks exactly like "the auth gate was
+silently ignored" (see G1). It is a false alarm: that file is a legacy webpack
+artifact Turbopack no longer populates.
+
+The authoritative artifact is **`.next/server/functions-config-manifest.json`**, which
+lists the proxy under `/_middleware` with its runtime and compiled matcher regexp.
+The build output line `ƒ Proxy (Middleware)` is the other reliable signal.
+
+This matters because the natural way to check the most dangerous failure mode in the
+build produces a convincing false positive. `tests/app/proxy-registration.test.ts`
+asserts against the correct manifest so the check cannot drift back.
