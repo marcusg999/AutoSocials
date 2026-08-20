@@ -1,0 +1,75 @@
+-- ===========================================================================
+-- TEST DOUBLE -- NEVER RUN THIS AGAINST A REAL DATABASE.
+--
+-- Supabase provides auth.users, auth.uid(), auth.jwt(), the anon/authenticated/
+-- service_role roles and the Vault. A plain Postgres has none of them, so this
+-- file recreates just enough of that surface for the RLS tests to run against a
+-- real Postgres engine rather than a mock.
+--
+-- The definitions of auth.uid()/auth.jwt() below are the same ones Supabase uses:
+-- they read the request.jwt.claims GUC. That is what makes these tests meaningful.
+-- ===========================================================================
+
+create extension if not exists pgcrypto;
+
+do $$ begin create role anon           nologin; exception when duplicate_object then null; end $$;
+do $$ begin create role authenticated  nologin; exception when duplicate_object then null; end $$;
+do $$ begin create role service_role   nologin bypassrls; exception when duplicate_object then null; end $$;
+
+create schema if not exists auth;
+grant usage on schema auth to anon, authenticated, service_role;
+
+create table if not exists auth.users (
+  id    uuid primary key default gen_random_uuid(),
+  email text unique
+);
+
+-- Identical to Supabase: the current user id, read from the request's JWT claims.
+create or replace function auth.uid() returns uuid
+language sql stable as $$
+  select nullif(current_setting('request.jwt.claims', true)::jsonb ->> 'sub', '')::uuid;
+$$;
+
+-- Identical to Supabase: the whole decoded JWT, including the "aal" claim.
+create or replace function auth.jwt() returns jsonb
+language sql stable as $$
+  select coalesce(nullif(current_setting('request.jwt.claims', true), '')::jsonb, '{}'::jsonb);
+$$;
+
+grant execute on function auth.uid(), auth.jwt() to anon, authenticated, service_role;
+
+-- Minimal stand-in for Supabase Vault. Stores secrets encrypted with pgcrypto so
+-- the tests exercise the same call shape; it is NOT the production Vault.
+create schema if not exists vault;
+
+create table if not exists vault.secrets (
+  id          uuid primary key default gen_random_uuid(),
+  name        text unique,
+  description text default '',
+  secret      text not null,
+  created_at  timestamptz default now()
+);
+
+create or replace function vault.create_secret(new_secret text, new_name text default null, new_description text default '')
+returns uuid language sql set search_path = public, vault as $$
+  insert into vault.secrets (name, description, secret)
+  values (new_name, new_description, public.pgp_sym_encrypt(new_secret, 'test-shim-key')::text)
+  returning id;
+$$;
+
+create or replace function vault.update_secret(secret_id uuid, new_secret text default null, new_name text default null, new_description text default null)
+returns void language sql set search_path = public, vault as $$
+  update vault.secrets
+     set secret = coalesce(public.pgp_sym_encrypt(new_secret, 'test-shim-key')::text, secret),
+         name = coalesce(new_name, name),
+         description = coalesce(new_description, description)
+   where id = secret_id;
+$$;
+
+create or replace view vault.decrypted_secrets as
+  select id, name, description, secret,
+         public.pgp_sym_decrypt(secret::bytea, 'test-shim-key') as decrypted_secret
+    from vault.secrets;
+
+-- Mirrors Supabase: the Vault is not reachable from client roles.
+revoke all on schema vault from anon, authenticated;
