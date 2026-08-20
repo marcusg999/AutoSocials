@@ -39,6 +39,11 @@ function walkProject(dir = '.', out: string[] = []): string[] {
   return out
 }
 
+// Every extension Next will compile as application code. Filtering on .ts/.tsx
+// alone made `app/leak/page.jsx` and `app/api/leak/route.js` -- both real, routable,
+// and unguarded -- invisible to every check in this file while the suite stayed green.
+const SOURCE = /\.(m|c)?[jt]sx?$/
+
 const appFiles = walkProject()
 
 /**
@@ -52,12 +57,12 @@ const actionFiles = appFiles.filter(
 // Every file convention Next will render as, or on behalf of, a route. A guard on
 // page.tsx alone leaves default.tsx (parallel-route slots), opengraph-image.tsx and
 // the metadata routes rendering with nothing but the proxy in front of them.
-const pageFiles = appFiles.filter((f) => /\/(page|default)\.tsx$/.test(f))
-const layoutFiles = appFiles.filter((f) => /\/(layout|template)\.tsx$/.test(f))
+const pageFiles = appFiles.filter((f) => /\/(page|default)\.(m|c)?[jt]sx?$/.test(f))
+const layoutFiles = appFiles.filter((f) => /\/(layout|template)\.(m|c)?[jt]sx?$/.test(f))
 const metadataRoutes = appFiles.filter(
-  (f) => /\/(opengraph-image|twitter-image|icon|apple-icon|sitemap|robots|not-found)\.tsx?$/.test(f),
+  (f) => /\/(opengraph-image|twitter-image|icon|apple-icon|sitemap|robots|not-found)\.(m|c)?[jt]sx?$/.test(f),
 )
-const routeHandlers = appFiles.filter((f) => /\/route\.tsx?$/.test(f))
+const routeHandlers = appFiles.filter((f) => /\/route\.(m|c)?[jt]sx?$/.test(f))
 
 /** Source with comments removed, so a commented-out guard cannot satisfy a match. */
 function code(file: string): string {
@@ -121,7 +126,7 @@ function bodyOf(file: string, name: string): string {
   return rest.slice(0, nextBoundary === -1 ? undefined : nextBoundary)
 }
 
-test.each(appFiles.filter((f) => /\.tsx?$/.test(f)).map((f) => relative(process.cwd(), f)))(
+test.each(appFiles.filter((f) => SOURCE.test(f)).map((f) => relative(process.cwd(), f)))(
   '%s — has no anonymous default export, which would hide anything declared inside it',
   (file) => {
     // `export default async function () {` binds no name, so both the
@@ -132,7 +137,7 @@ test.each(appFiles.filter((f) => /\.tsx?$/.test(f)).map((f) => relative(process.
       .not.toMatch(/export\s+default\s+(async\s+)?function\s*\(/)
   })
 
-test.each(appFiles.filter((f) => /\.tsx?$/.test(f)).map((f) => relative(process.cwd(), f)))(
+test.each(appFiles.filter((f) => SOURCE.test(f)).map((f) => relative(process.cwd(), f)))(
   '%s — any inline server action is guarded where it is declared',
   (file) => {
     // An action can be declared inside a component body with its own 'use server'
@@ -150,6 +155,44 @@ test.each(appFiles.filter((f) => /\.tsx?$/.test(f)).map((f) => relative(process.
         .toMatch(/require(MfaSession|SignedInUser)OrThrow\(/)
     }
   })
+
+describe('the enumeration this file performs is the complete one', () => {
+  // Six review rounds have each found a file this suite models with a regex that is
+  // narrower than the thing it claims to cover -- .tsx but not .jsx, page.tsx but
+  // not default.tsx, `export async function` but not `export const`. These
+  // assertions make the next narrowing fail loudly rather than be found by someone
+  // walking an unguarded route.
+  test('every routable file on disk is picked up by one of the collectors', () => {
+    const ROUTE_CONVENTIONS =
+      /\/(page|layout|template|default|route|loading|error|global-error|not-found|opengraph-image|twitter-image|icon|apple-icon|sitemap|robots)\.(m|c)?[jt]sx?$/
+    const routable = appFiles.filter((f) => f.startsWith('app/') && ROUTE_CONVENTIONS.test(f))
+    const collected = new Set([...pageFiles, ...layoutFiles, ...metadataRoutes, ...routeHandlers])
+
+    // Purely presentational conventions render no data of their own.
+    const NO_DATA_CONVENTIONS = /\/(loading|error|global-error)\.(m|c)?[jt]sx?$/
+
+    for (const file of routable) {
+      if (NO_DATA_CONVENTIONS.test(file)) continue
+      expect([...collected], `${relative(process.cwd(), file)} is a real route but no collector in `
+        + 'this file picks it up, so nothing checks its guards').toContain(file)
+    }
+  })
+
+  test('no route handler sits at a path the proxy matcher excludes', () => {
+    // The matcher exempts media extensions so files in public/ are served. A route
+    // handler can live at any path, including one ending .png -- and such a route
+    // was served 200 anonymously with no proxy, no guard and no security headers.
+    // Static assets and routes cannot be told apart by path, so the rule is that
+    // our routes must not land on an excluded one.
+    const MEDIA = /\.(svg|png|jpg|jpeg|gif|webp|avif|ico|woff|woff2|ttf|otf|eot|mp4|webm|mp3|wav)$/
+    for (const file of routeHandlers) {
+      const urlPath = '/' + relative('app', file).replace(/\/route\.(m|c)?[jt]sx?$/, '')
+      expect(MEDIA.test(urlPath), `${relative(process.cwd(), file)} is served at ${urlPath}, which `
+        + 'the proxy matcher excludes — it would be reachable with no auth and no security headers')
+        .toBe(false)
+    }
+  })
+})
 
 test('there is at least one server action to check, so this test cannot pass vacuously', () => {
   expect(actionFiles.length).toBeGreaterThan(0)

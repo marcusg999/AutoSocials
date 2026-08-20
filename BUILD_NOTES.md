@@ -844,6 +844,129 @@ for tables and re-introducing it for schemas one line up is not a fix.**
 
 ---
 
+## Gotchas found by the sixth adversarial review
+
+Round 6 confirmed the previous round's three deciding fixes are real — the ack
+handshake catches a squatter and reports the child's stderr, dynamic segments are
+scanned, the allowlist is gone — and then found **two CRITICALs in the commit whose
+message was "Close the view and third-schema gaps"**. Both were reproduced here
+before being fixed.
+
+### G69 — The view check tested SELECT, so a cross-tenant WRITE through a view sailed past
+The view class test added by self-review only asked `has_table_privilege(..., 'SELECT')`
+and only demanded `security_invoker = true` *inside* `if (view.auth_select)`. A view
+granted INSERT but not SELECT fell through the loop with **zero assertions**.
+
+```
+direct insert into posts:            ERROR: new row violates row-level security policy
+same insert through the view:        INSERT 0 1
+ALPHA posts: ALPHA-PRIVATE | PLANTED BY OUTSIDER
+```
+
+The check now covers SELECT, INSERT, UPDATE and DELETE.
+
+### G70 — `has_table_privilege` returns false for a column-level grant
+Widening the check to all four privileges was still not enough, and this is the part
+worth remembering. The hostile grant was `grant insert (business_id, body, …)` — a
+**column-level** grant — and `has_table_privilege(role, oid, 'INSERT')` reports
+`false` for those. The first fix attempt looked right and the attack still passed.
+
+`has_any_column_privilege` is the correct predicate for SELECT/INSERT/UPDATE;
+DELETE has no column-level form. Only after that did the replay fail as it should.
+
+**Two functions with almost the same name answer different questions, and the one
+that reads more naturally is the wrong one.**
+
+### G71 — The function check tested three roles inside `app` and only `anon` outside it
+`public` is precisely what PostgREST exposes as `/rest/v1/rpc/<name>`, and
+`authenticated` — not `anon` — is the tenancy threat model. A `SECURITY DEFINER`
+function in `public` granted to `authenticated` returned every tenant's posts with
+the suite green:
+
+```
+BETA reads via public.all_posts(): 1 posts across ALL tenants   (BETA is a member of BUSINESS_2 only)
+class test checks only anon outside app: anon_exec=false -> PASSES
+```
+
+The three-role assertion now applies in every schema we own, against an allowlist of
+the five helpers a browser session may legitimately call.
+
+### G72 — Exempting a schema also exempts anything of ours that lands in it
+The previous round excluded `extensions` wholesale from the class tests — while
+`0010` grants `authenticated` USAGE on that schema. A business-scoped table created
+there was cross-tenant readable with every test green.
+
+Extensions bring hundreds of functions nobody here wrote, so the exemption is real —
+but it is now expressed as *"this function belongs to an extension"*
+(`pg_depend.deptype = 'e'`), not *"this function is in that schema"*. Tables in
+`extensions` are checked like any other.
+
+### G73 — Next compiles `.js` and `.jsx`; every guard collector filtered on `.ts`/`.tsx`
+Next's default `pageExtensions` is `['tsx','ts','jsx','js']`. An `app/leak/page.jsx`
+with no session guard, an inline unguarded `'use server'` action, and a live query
+against `businesses` — plus an `app/api/leak/route.js` returning every business —
+both built into real routes and were **invisible to every check in the guard file**.
+Test count identical to the clean repo.
+
+All collectors now match `/\.(m|c)?[jt]sx?$/`.
+
+### G74 — A route handler can live at a path the proxy matcher exempts
+The matcher excludes media extensions so files in `public/` are served rather than
+redirected. But a route handler can sit at *any* path, including one ending `.png`:
+
+```
+/dashboard   -> 307 /login
+/api/leak    -> 307 /login
+/export.png  -> 200 {"businesses":[],"marker":"NO-PROXY-NO-GUARD"}   security headers: NONE
+```
+
+Static assets and routes cannot be told apart by path, so the rule is now asserted
+from the other side: no `app/**/route.*` may sit at a path the matcher excludes.
+
+### G75 — The scanner read one URL shape per route, with one verb
+A route returning the service-role key only for `?format=full` passed cleanly, as
+would anything behind a POST. The scan now issues a query-string variant for every
+route and a POST for every route handler.
+
+### G76 — `redirect: 'follow'` throws away the redirect's own headers
+The scanner's comment said *"Header values count too: a secret in a Set-Cookie or a
+custom header ships"* — and then followed redirects, discarding exactly those
+headers. A route appending the service-role key to `Set-Cookie` on a 307 passed the
+whole scan. Worse, a route that redirected was `continue`d past entirely, so **six
+of sixteen documents were silently unscanned** while the run reported success.
+
+Redirects are now `manual`: every response is inspected, headers included, and a
+redirect whose destination is not itself scanned is a failure rather than a note.
+Coverage went from 10 responses to 24.
+
+### G77 — A production build with no `APP_ORIGIN` bakes `allowedOrigins: []`
+Which makes Next fall back to deriving the expected origin from forwarded headers —
+the exact behaviour the config comment claims it prevents. `npm run verify` was
+itself building this way. The build now fails outright rather than shipping a config
+that quietly does the opposite of what it says.
+
+### G78 — `npm run db:down` destroys the append-only audit log
+`0009`'s rollback goes to real trouble not to delete a business that is in use, and
+then `0004`'s drops `audit_log` two steps later — the one table whose entire design
+premise is that no role can delete a row from it. Append-only triggers cannot stop
+`DROP TABLE`, so the guard lives in the runner: `down` refuses while `audit_log` has
+rows unless `ALLOW_DESTRUCTIVE_ROLLBACK=yes` is set explicitly.
+
+### G79 — The lesson, stated once: a filter is a claim about a population
+Round 6's summary is the most useful sentence produced in six rounds: *"Every class
+test models the codebase with a regex or a relkind filter, and the filter is always
+narrower than the thing it claims to cover."* Six rounds, six variants — `.tsx` not
+`.jsx`, `('public','app')` not every schema, `relkind r/p` not `v/m/f`, SELECT not
+every privilege, `anon` not `authenticated`, table-level not column-level.
+
+Each class test now carries a **completeness assertion**: the set it enumerated must
+equal the real population — every routable file on disk is picked up by a collector,
+every relation kind present in a schema we own is covered by some check, `public`
+and `app` are actually being scanned. The narrowing itself now fails, rather than
+the seventh variant being found by a reviewer walking a row across a tenant boundary.
+
+---
+
 ## Known, accepted limitations
 
 Stated plainly rather than left to be discovered.

@@ -20,10 +20,28 @@ import { asAdmin, asAnon, asUser, dropDatabase, expectRejected, freshDatabase } 
  */
 const OUR_SCHEMAS = `
   n.nspname not in ('pg_catalog', 'information_schema', 'pg_toast',
-                    'auth', 'storage', 'realtime', 'vault', 'extensions',
+                    'auth', 'storage', 'realtime', 'vault',
                     'graphql', 'graphql_public', 'supabase_functions', 'cron', 'net')
   and n.nspname not like 'pg_temp%' and n.nspname not like 'pg_toast_temp%'
 `
+
+/**
+ * Functions we did not write are exempt from the function checks -- but the test is
+ * "does this function belong to an EXTENSION", not "is it in a particular schema".
+ * Exempting a whole schema would also exempt anything of ours that lands there, and
+ * `extensions` is deliberately IN OUR_SCHEMAS above because 0010 grants
+ * `authenticated` USAGE on it: a business-scoped table created there was
+ * cross-tenant readable while every class test stayed green.
+ */
+const NOT_OUR_FUNCTIONS = `
+  not exists (
+    select 1 from pg_depend d
+    where d.objid = p.oid and d.deptype = 'e'
+  )
+`
+
+/** Every privilege that lets a role get data in or out of a relation. */
+const ANY_DATA_PRIVILEGE = ['SELECT', 'INSERT', 'UPDATE', 'DELETE'] as const
 
 const DB = 'postdeck_hardening_test'
 let url: string
@@ -485,47 +503,50 @@ describe('authorship is set once and never changes', () => {
 
 describe('CLASS: only the intended roles can execute anything', () => {
   // The five yes/no helpers an RLS policy needs a signed-in user to be able to call.
-  // Everything else in schema `app` is server-side only.
-  const CALLABLE_BY_AUTHENTICATED = [
-    'has_completed_mfa', 'is_member_of', 'has_role_in', 'post_belongs_to', 'account_belongs_to',
-  ]
+  // Everything else we write, in any schema, is server-side only.
+  const CALLABLE_BY_AUTHENTICATED = new Set([
+    'app.has_completed_mfa', 'app.is_member_of', 'app.has_role_in',
+    'app.post_belongs_to', 'app.account_belongs_to',
+  ])
 
-  test('no app function is callable by anon, and only the allowlist by authenticated', async () => {
-    // Checking PUBLIC alone is too weak: `authenticated` holds USAGE on schema app,
-    // so a helper granted to it reads every tenant while a PUBLIC-only check stays
-    // green. This asserts all three roles.
+  test('no function we wrote is callable by anon, and only the allowlist by authenticated', async () => {
+    // Checked across EVERY schema we own and for all three roles.
+    //
+    // An earlier version checked all three roles inside schema `app` but only
+    // `anon` outside it -- and `public` is exactly what PostgREST exposes as
+    // /rest/v1/rpc/<name>, while `authenticated`, not `anon`, is the tenancy threat
+    // model. Verified: a SECURITY DEFINER function in `public` granted to
+    // `authenticated` returned every tenant's posts while the suite stayed green.
     await asAdmin(url, async (q) => {
       const r = await q(`
-        select p.proname,
+        select n.nspname || '.' || p.proname as name,
                has_function_privilege('anon',          p.oid, 'EXECUTE') as anon_exec,
                has_function_privilege('authenticated', p.oid, 'EXECUTE') as auth_exec,
                has_function_privilege('public',        p.oid, 'EXECUTE') as public_exec
         from pg_proc p join pg_namespace n on n.oid = p.pronamespace
-        where n.nspname = 'app' order by p.proname`)
-      expect(r.rowCount).toBeGreaterThan(0)
+        where ${OUR_SCHEMAS} and ${NOT_OUR_FUNCTIONS}
+        order by 1`)
+
+      expect(r.rowCount, 'no functions found — this test would be vacuous').toBeGreaterThan(0)
       for (const fn of r.rows) {
-        expect(fn.anon_exec,   `app.${fn.proname} is callable by anon`).toBe(false)
-        expect(fn.public_exec, `app.${fn.proname} is callable by PUBLIC`).toBe(false)
+        expect(fn.anon_exec,   `${fn.name} is callable by anon`).toBe(false)
+        expect(fn.public_exec, `${fn.name} is callable by PUBLIC`).toBe(false)
         expect(
           fn.auth_exec,
-          `app.${fn.proname} is callable by authenticated but is not on the allowlist`,
-        ).toBe(CALLABLE_BY_AUTHENTICATED.includes(fn.proname))
+          `${fn.name} is callable by authenticated but is not on the allowlist`,
+        ).toBe(CALLABLE_BY_AUTHENTICATED.has(fn.name))
       }
     })
   })
 
-  test('no function in any schema we own is callable by anon', async () => {
-    // `public` is what PostgREST exposes as RPC. An extension installed here hands
-    // every one of its functions to signed-out callers -- pgcrypto's crypt() at a
-    // high bcrypt cost is a one-second-per-call CPU sink, unauthenticated.
-    await asAdmin(url, async (q) => {
-      const r = await q(`
-        select p.proname
-        from pg_proc p join pg_namespace n on n.oid = p.pronamespace
-        where ${OUR_SCHEMAS} and n.nspname <> 'app'
-          and has_function_privilege('anon', p.oid, 'EXECUTE')
-        order by p.proname`)
-      expect(r.rows.map((x) => x.proname), 'these are reachable by a signed-out caller').toEqual([])
+  test('a signed-in user cannot forge audit rows via the trigger function', async () => {
+    // The concrete attack: attach app.audit_row_change to a table you control and
+    // it writes into whatever business_id your row claims, as the function owner.
+    await asUser(url, OUTSIDER, 'aal2', async (q) => {
+      await q(`create temp table forge (id uuid, business_id uuid)`)
+      const err = await expectRejected(() =>
+        q(`create trigger t after insert on forge for each row execute function app.audit_row_change()`))
+      expect(err.message).toMatch(/permission denied/i)
     })
   })
 })
@@ -583,7 +604,7 @@ describe('CLASS: every table is behind row level security', () => {
         select n.nspname || '.' || c.relname as table_name,
                c.relrowsecurity, c.relforcerowsecurity
         from pg_class c join pg_namespace n on n.oid = c.relnamespace
-        where ${OUR_SCHEMAS} and c.relkind in ('r', 'p')
+        where ${OUR_SCHEMAS} and c.relkind in ('r', 'p', 'f')
           -- The migration ledger holds no tenant data and is written before any
           -- policy could exist.
           and not (n.nspname = 'public' and c.relname = 'schema_migrations')
@@ -598,42 +619,96 @@ describe('CLASS: every table is behind row level security', () => {
   })
 })
 
-describe('CLASS: a view cannot be used to read around row level security', () => {
-  test('every view reachable by a client role runs as the caller, and no materialized view is reachable at all', async () => {
+describe('CLASS: a view cannot be used to read or write around row level security', () => {
+  test('every view a client role can touch runs as the caller, and no materialized or foreign table is reachable', async () => {
     // Views are the gap RLS does not cover. A view executes with the privileges of
     // its OWNER unless `security_invoker = true`, which is off by default -- so a
-    // convenience view over posts hands every tenant every row, with all the
-    // underlying policies still perfectly intact. Verified directly: a plain view
-    // over public.posts returned another tenant's private body, and setting
-    // security_invoker = true returned nothing.
+    // view over posts hands every tenant every row with all the policies intact.
     //
-    // A materialized view is worse: it stores its own copy and can never respect
-    // RLS at all, so it must not be granted to a client role under any conditions.
+    // The check covers INSERT, UPDATE and DELETE as well as SELECT. An earlier
+    // version tested SELECT only, so a view granted INSERT-but-not-SELECT fell
+    // through the loop with no assertions at all. Verified: a cross-tenant INSERT
+    // through exactly such a view landed a forged row in another tenant's posts,
+    // while the direct insert was correctly refused by RLS.
+    //
+    // Materialized and foreign tables cannot respect RLS at all -- one stores its
+    // own copy, the other lives in another database -- so they must not be
+    // reachable by a client role under any conditions.
     await asAdmin(url, async (q) => {
       const r = await q(`
         select n.nspname || '.' || c.relname            as name,
                c.relkind::text                          as kind,
                coalesce(array_to_string(c.reloptions, ','), '') as options,
-               has_table_privilege('anon',          c.oid, 'SELECT') as anon_select,
-               has_table_privilege('authenticated', c.oid, 'SELECT') as auth_select
+               ${ANY_DATA_PRIVILEGE.map((p) => {
+                 // DELETE has no column-level form; the other three do, and
+                 // has_table_privilege returns FALSE for a column-only grant.
+                 // Missing that let a view granted `insert (col, col)` -- with no
+                 // table-level INSERT at all -- pass every assertion here while
+                 // accepting a cross-tenant write.
+                 const fn = p === 'DELETE' ? 'has_table_privilege' : 'has_any_column_privilege'
+                 return `
+                 ${fn}('anon',          c.oid, '${p}') as anon_${p.toLowerCase()},
+                 ${fn}('authenticated', c.oid, '${p}') as auth_${p.toLowerCase()}`
+               }).join(',')}
         from pg_class c join pg_namespace n on n.oid = c.relnamespace
-        where ${OUR_SCHEMAS} and c.relkind in ('v', 'm')
+        where ${OUR_SCHEMAS} and c.relkind in ('v', 'm', 'f')
         order by 1`)
 
-      for (const view of r.rows) {
-        if (view.kind === 'm') {
-          expect(view.anon_select, `${view.name} is a materialized view readable by anon`).toBe(false)
-          expect(view.auth_select, `${view.name} is a materialized view readable by authenticated; `
-            + 'it holds its own copy of the rows and cannot respect RLS').toBe(false)
+      for (const rel of r.rows) {
+        const anonReach = ANY_DATA_PRIVILEGE.filter((p) => rel[`anon_${p.toLowerCase()}`])
+        const authReach = ANY_DATA_PRIVILEGE.filter((p) => rel[`auth_${p.toLowerCase()}`])
+
+        expect(anonReach, `${rel.name} is reachable by anon via ${anonReach.join(', ')}`).toEqual([])
+
+        if (rel.kind === 'm' || rel.kind === 'f') {
+          const kind = rel.kind === 'm' ? 'materialized view' : 'foreign table'
+          expect(authReach, `${rel.name} is a ${kind} reachable by authenticated via `
+            + `${authReach.join(', ')}; it cannot respect row level security`).toEqual([])
           continue
         }
-        expect(view.anon_select, `${view.name} is readable by anon`).toBe(false)
-        if (view.auth_select) {
-          expect(view.options, `${view.name} is readable by authenticated but does not set `
-            + 'security_invoker=true, so it runs as its owner and bypasses every policy beneath it')
+
+        if (authReach.length > 0) {
+          expect(rel.options, `${rel.name} is reachable by authenticated via `
+            + `${authReach.join(', ')} but does not set security_invoker=true, so it runs as its `
+            + 'owner and bypasses every policy beneath it')
             .toMatch(/security_invoker\s*=\s*(true|on)/i)
         }
       }
+    })
+  })
+})
+
+describe('CLASS: the enumeration each check performs is the complete one', () => {
+  // The lesson of six review rounds. Every class test here models the database with
+  // a filter, and each time a filter has been narrower than the property it claims
+  // -- one schema, one relkind, one privilege, one column name. These assertions
+  // exist so the NEXT narrowing fails loudly instead of being discovered by a
+  // reviewer walking a row across a tenant boundary.
+
+  test('no relation kind we own escapes both the table checks and the view checks', async () => {
+    await asAdmin(url, async (q) => {
+      const r = await q(`
+        select distinct c.relkind::text as kind
+        from pg_class c join pg_namespace n on n.oid = c.relnamespace
+        where ${OUR_SCHEMAS} and c.relkind not in ('i', 'S', 'c', 't', 'I')
+        order by 1`)
+      const covered = ['r', 'p', 'f', 'v', 'm']
+      for (const row of r.rows) {
+        expect(covered, `relkind '${row.kind}' exists in a schema we own but no class test looks at it`)
+          .toContain(row.kind)
+      }
+    })
+  })
+
+  test('every schema we own is actually scanned, so a new one cannot hide a table', async () => {
+    await asAdmin(url, async (q) => {
+      const all = await q(`select nspname from pg_namespace n where ${OUR_SCHEMAS} order by 1`)
+      const names = all.rows.map((x) => x.nspname)
+      // The schemas this project creates. A schema appearing here that nobody
+      // expected is fine -- it is scanned. One MISSING would mean the exclusion
+      // list had grown to swallow something of ours.
+      expect(names, 'the public schema is not being scanned').toContain('public')
+      expect(names, 'the app schema is not being scanned').toContain('app')
     })
   })
 })

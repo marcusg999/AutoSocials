@@ -18,7 +18,7 @@
     "test:db": "vitest run tests/db",
     "test:secrets": "tsx scripts/check-no-secrets.ts",
     "gauntlet": "tsx scripts/gauntlet.ts",
-    "verify": "npm run build && npm run typecheck && npm run test && npm run test:secrets"
+    "verify": "APP_ORIGIN=${APP_ORIGIN:-http://127.0.0.1:3000} npm run build && npm run typecheck && npm run test && npm run test:secrets"
   },
   "dependencies": {
     "@supabase/ssr": "0.12.4",

@@ -1,5 +1,17 @@
 import type { NextConfig } from 'next'
 
+// A production build with no APP_ORIGIN bakes `allowedOrigins: []` into the
+// artifact, and Next then falls back to deriving the expected origin from forwarded
+// headers -- the exact behaviour the comment below says it prevents. Fail the build
+// instead of shipping a config that quietly does the opposite of what it claims.
+if (process.env.NODE_ENV === 'production' && !process.env.APP_ORIGIN) {
+  throw new Error(
+    'APP_ORIGIN must be set for a production build. It is baked into '
+    + 'serverActions.allowedOrigins, and without it Next.js falls back to trusting '
+    + 'forwarded headers for its Server Action origin check.',
+  )
+}
+
 const nextConfig: NextConfig = {
   reactStrictMode: true,
   // Don't advertise the framework version to attackers scanning response headers.

@@ -173,22 +173,33 @@ function buildEnvironment(): NodeJS.ProcessEnv {
  * outcome; a route nobody looked at is not.
  */
 function routesFromManifest(): string[] {
+  return [...routeTable().keys()]
+}
+
+/** Each servable URL, and whether it is a route handler (so it accepts more verbs). */
+function routeTable(): Map<string, { isHandler: boolean }> {
   const manifestPath = join(ROOT, '.next/server/app-paths-manifest.json')
-  if (!existsSync(manifestPath)) return []
+  if (!existsSync(manifestPath)) return new Map()
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, string>
-  const routes = new Set<string>()
+  const routes = new Map<string, { isHandler: boolean }>()
   for (const key of Object.keys(manifest)) {
+    const isHandler = key.endsWith('/route')
     let route = key.replace(/\/(page|route)$/, '')
     if (route.startsWith('/_')) continue
+
+    // Route groups `(marketing)` and parallel slots `@modal` organise files and are
+    // NOT part of the URL. Leaving them in made the scan fetch a path that does not
+    // exist, fail on the 404, and never read the page that does exist.
+    route = route.replace(/\/\([^/]+\)/g, '').replace(/\/@[^/]+/g, '')
 
     // [...slug] and [[...slug]] take several segments; [id] takes one.
     route = route
       .replace(/\[\[?\.\.\.[^\]]+\]\]?/g, 'aaaaaaaa-0000-4000-8000-000000000000/second')
       .replace(/\[[^\]]+\]/g, 'aaaaaaaa-0000-4000-8000-000000000000')
 
-    routes.add(route === '' ? '/' : route)
+    routes.set(route === '' ? '/' : route, { isHandler })
   }
-  return [...routes]
+  return routes
 }
 
 /**
@@ -213,29 +224,43 @@ function startSupabaseStub(port: number) {
     res.writeHead(200)
     res.end(url.startsWith('/rest/v1/') ? '[]' : '{}')
   })
+  server.on('error', (error) => {
+    console.error(`  the Supabase stub could not bind port ${port}: ${(error as Error).message}`)
+    process.exitCode = 1
+  })
   server.listen(port, '127.0.0.1')
   return server
 }
 
-type Fetched = { text: string; status: number; finalPath: string }
+type Fetched = { text: string; status: number; location: string | null }
 
-async function fetchDocument(url: string, extra: Record<string, string> = {}): Promise<Fetched> {
+async function fetchDocument(
+  url: string,
+  extra: Record<string, string> = {},
+  method: 'GET' | 'POST' = 'GET',
+): Promise<Fetched> {
   try {
-    // Redirects are followed, because several routes redirect by design even for a
-    // fully authenticated user ('/' and the MFA pages all send a verified session on
-    // to the dashboard). What we want is the document that is finally rendered.
+    // NEVER follow. `redirect: 'follow'` discards the redirect response itself --
+    // including its Set-Cookie and any custom header -- and a secret in a
+    // Set-Cookie on a 307 reaches the browser just as surely as one in a body.
+    // Verified: a route appending the service-role key to Set-Cookie on a redirect
+    // passed the whole scan.
     const response = await fetch(url, {
+      method,
       headers: { [SCAN_HEADER]: SCAN_TOKEN, ...extra },
-      redirect: 'follow',
+      redirect: 'manual',
     })
     const body = await response.text()
     // Header values count too: a secret in a Set-Cookie or a custom header ships.
     const headerText = [...response.headers.entries()].map(([k, v]) => `${k}: ${v}`).join('\n')
-    let finalPath = new URL(url).pathname
-    try { finalPath = new URL(response.url).pathname } catch { /* keep the request path */ }
-    return { text: `${headerText}\n${body}`, status: response.status, finalPath }
+    let location: string | null = null
+    const rawLocation = response.headers.get('location')
+    if (rawLocation) {
+      try { location = new URL(rawLocation, ORIGIN).pathname } catch { location = rawLocation }
+    }
+    return { text: `${headerText}\n${body}`, status: response.status, location }
   } catch {
-    return { text: '', status: 0, finalPath: '' }
+    return { text: '', status: 0, location: null }
   }
 }
 
@@ -319,39 +344,55 @@ async function checkServedResponses() {
     const notRendered: string[] = []
     const redirected: string[] = []
 
-    for (const route of routes) {
-      // The HTML first. If it redirects somewhere that is scanned on its own turn,
-      // the whole route is covered and there is nothing more to fetch for it.
-      const html = await fetchDocument(`${ORIGIN}${route}`)
-      if (html.status === 200 && html.finalPath !== route && routes.includes(html.finalPath)) {
-        redirected.push(`${route} → ${html.finalPath}, which is scanned separately`)
-        continue
-      }
+    const table = routeTable()
 
-      const documents: Array<[string, Fetched]> = [
-        [`${route} (HTML)`, html],
+    /** Inspects one response and records it, or records why it could not be. */
+    const inspect = (label: string, doc: Fetched, route: string) => {
+      if (doc.status === 0) {
+        notRendered.push(`${label} could not be fetched`)
+        return
+      }
+      // A 200 that is really Next's error boundary carries no page content.
+      if (doc.status === 200 && /__next_error__|"digest":"NEXT_/.test(doc.text)) {
+        notRendered.push(`${label} rendered an error boundary`)
+        return
+      }
+      // Anything else IS inspected, including a redirect. A redirect's headers go
+      // to the browser, and Set-Cookie is exactly where a leaked value would sit.
+      scanned++
+      for (const [name, canary] of Object.entries(CANARIES)) {
+        if (doc.text.includes(canary)) found.push(`${name} leaked into the response for ${label}`)
+      }
+      if (/service_role/.test(doc.text)) {
+        found.push(`the string "service_role" appears in the response for ${label}`)
+      }
+      if (doc.status >= 300 && doc.status < 400) {
+        const destination = doc.location ?? '(no location header)'
+        if (!table.has(destination)) {
+          notRendered.push(`${label} redirects to ${destination}, which is not itself scanned`)
+        } else {
+          redirected.push(`${route} → ${destination}, scanned on its own turn`)
+        }
+      }
+    }
+
+    for (const [route, meta] of table) {
+      // A route handler answers more than GET, and a secret can be behind any verb.
+      // A query string can select a different code path entirely: a report route
+      // returning the service-role key only for ?format=full passed a GET-only scan.
+      const requests: Array<[string, Promise<Fetched>]> = [
+        [`${route} (HTML)`, fetchDocument(`${ORIGIN}${route}`)],
+        [`${route} ?query`, fetchDocument(`${ORIGIN}${route}?format=full&all=1&debug=1&raw=true`)],
+      ]
+      if (meta.isHandler) {
+        requests.push([`${route} (POST)`, fetchDocument(`${ORIGIN}${route}`, {}, 'POST')])
+      } else {
         // The RSC flight payload: what a client-side navigation receives, and where
         // a server-to-client prop actually lands.
-        [`${route} (RSC flight)`, await fetchDocument(`${ORIGIN}${route}`, { RSC: '1' })],
-      ]
-
-      for (const [label, doc] of documents) {
-        if (doc.status !== 200) {
-          notRendered.push(`${label} returned ${doc.status}`)
-          continue
-        }
-        // A 200 that is Next's error boundary proves nothing, so it must not be
-        // counted as coverage either.
-        if (/__next_error__|"digest":"NEXT_/.test(doc.text)) {
-          notRendered.push(`${label} rendered an error boundary`)
-          continue
-        }
-        scanned++
-        for (const [name, canary] of Object.entries(CANARIES)) {
-          if (doc.text.includes(canary)) found.push(`${name} leaked into the response for ${label}`)
-        }
-        if (/service_role/.test(doc.text)) found.push(`the string "service_role" appears in the response for ${label}`)
+        requests.push([`${route} (RSC flight)`, fetchDocument(`${ORIGIN}${route}`, { RSC: '1' })])
       }
+
+      for (const [label, pending] of requests) inspect(label, await pending, route)
     }
 
     if (redirected.length) {
