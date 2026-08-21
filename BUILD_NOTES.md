@@ -1090,6 +1090,89 @@ grant over what exists now.
 
 ---
 
+### G87 — A trigger's blind spot was the TABLE's schema, not the function's
+
+`0010` revokes `EXECUTE` on everything in `app` and G81 added a reviewed-list of
+trigger functions, because a `SECURITY DEFINER` trigger runs regardless of who may
+call it. The enforcing query joined `pg_trigger` to the table and filtered on the
+TABLE's namespace through `OUR_SCHEMAS` — which excludes `auth`, `storage`,
+`realtime` and the rest, schemas every real Supabase project has.
+
+So a definer function in `app` (a schema that IS scanned, and where the function
+passes every other check precisely because nobody holds `EXECUTE` on it), attached
+to a trigger on `auth.users`, could never appear in the enumerated set. `.toEqual()`
+cannot fail on a row the query structurally excludes. One `insert into auth.users`
+— a second sign-up — copied every tenant's posts into the attacker's business.
+
+Verified directly: the query returned exactly its three known functions while
+`auth.users -> app.mirror_posts` sat alongside them in `pg_trigger`.
+
+The population is now every non-internal trigger that **either runs one of our
+functions or sits on one of our tables**, whichever schema each is in, listed as
+`table -> function` because both halves matter. Supabase's own triggers run
+Supabase's functions on Supabase's tables, so they match neither half and stay out.
+
+### G88 — Diffing the set of objects cannot see a `GRANT`
+
+G82 replaced the schema exclusion list with a baseline diff: snapshot every object
+before the migrations, snapshot after, and fail if anything new landed outside the
+scanned schemas. That is falsifiable only for objects being **created**.
+
+`grant usage on schema auth to authenticated; grant select on auth.users to
+authenticated;` creates nothing. `auth.users` is already in the baseline, so it is
+filtered out of the diff, and `auth` is excluded from every other class test. Two
+lines in a migration hand every user's email address to every signed-in member of
+every tenant. Verified: **109/109 green** with that grant applied.
+
+The same hole covered `ALTER ... OWNER TO`, column-level grants (which live in
+`pg_attribute.attacl`, not `relacl`), and attaching a trigger to a baseline table.
+
+The snapshot is now a signature, not a name: each object carries its ACL and its
+owner, schemas carry `nspacl`, columns with an `attacl` are listed individually, and
+triggers are listed as objects. A `GRANT` changes the signature, so the diff sees it.
+
+### G89 — "This page is dataless" was a claim about one file, not about what the page runs
+
+Two separate checks — `RENDERS_NO_DATA` in the guards test and `datalessRoutes()` in
+the secret scanner — excuse a page from the session requirement by greping **that
+page's source** for `.from(` / `.rpc(` / `createSupabase`. Neither followed imports.
+
+Move the query one module away and both certify the page as dataless:
+
+```ts
+// app/login/page.tsx — an anonymous route
+import { everyTenant } from '@/lib/reporting'   // service-role client, no RLS
+const tenants = await everyTenant()
+```
+
+Anonymous `GET /login`, no cookies, rendered every business in the system.
+Verified: **166/166 green**, build clean, secret scan clean — the scan's canary grep
+does not fire because the leak is tenant data, not the server's own env secret.
+
+Both checks now read the file **plus its transitive local imports**
+(`scripts/module-closure.ts`). Two details that matter:
+
+- A module whose FIRST statement is `'use server'` is skipped. It is a separate
+  entry point reached only by a POST, with its own CSRF/session/audit checks; without
+  this, every page that renders a form looks like it queries at render time. An
+  INLINE `'use server'` inside a function body is not first, so that file stays in.
+- The patterns differ by scope. In the page file itself, merely constructing a client
+  is suspicious. Across the closure it is not — `csrfField()` builds one to bind the
+  token to the session subject — so the closure is checked for an actual **query**.
+
+### G90 — An action's return value is a channel the secret scan cannot read
+
+Server actions are POSTed to the page they live on; the scanner POSTs only route
+handlers, and its flight probe is a GET. Reaching an action needs a live session and
+a CSRF token. So an action returning `` `db=${process.env.DATABASE_URL}` `` passes
+the guards test (it is CSRF-checked, session-guarded and audited — everything that
+test asserts) and passes the full secret scan.
+
+Rather than claim coverage the scan does not have, the channel is closed: every
+action in this phase reports its outcome by redirecting, and a test requires each one
+to declare `Promise<void>`. Confirmed falsifiable — changing one action to
+`Promise<string>` fails it.
+
 ## Known, accepted limitations
 
 Stated plainly rather than left to be discovered.

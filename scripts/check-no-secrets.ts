@@ -11,6 +11,7 @@
 import { execFileSync, spawn } from 'node:child_process'
 import { createServer } from 'node:http'
 import { SCAN_ACK_HEADER, SCAN_HEADER, SCAN_STATE_HEADER, scanAcknowledgement } from '../lib/security/scan-mode'
+import { closureSource } from './module-closure'
 import { existsSync, readFileSync, readdirSync, statSync, rmSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { join, relative } from 'node:path'
@@ -294,12 +295,17 @@ function datalessRoutes(): Set<string> {
   if (!existsSync(appDir)) return dataless
   for (const file of walk(appDir)) {
     if (!/\/page\.(m|c)?[jt]sx?$/.test(file)) continue
-    const source = readFileSync(file, 'utf8')
-    // Anything that touches Supabase or the session is NOT dataless. Matching only
-    // `.from(`/`.rpc(`/`createSupabase` excused /mfa/verify -- which reads the
-    // user's factor list through supabase.auth -- so a page that never rendered
-    // was quietly written off as having nothing to render.
-    if (/supabase|resolveSessionState|requireMfaSession|requireSignedInUser/.test(source)) continue
+    // The page AND everything it imports. Anything that touches Supabase or the
+    // session is NOT dataless. Matching only `.from(`/`.rpc(`/`createSupabase`
+    // excused /mfa/verify -- which reads the user's factor list through
+    // supabase.auth -- so a page that never rendered was written off as having
+    // nothing to render; and reading only the page file excused /login while a
+    // helper one import away served every tenant to an anonymous visitor.
+    const own = readFileSync(file, 'utf8')
+    if (/supabase|resolveSessionState|requireMfaSession|requireSignedInUser/.test(own)) continue
+    // Across the closure only an actual query counts: `supabase` appears in the
+    // closure of every page that renders a form, via csrfField().
+    if (/\.from\(|\.rpc\(/.test(closureSource(file, ROOT))) continue
     const key = '/' + relative(appDir, file).replace(/\/?page\.(m|c)?[jt]sx?$/, '')
     dataless.add(fillDynamicSegments(key))
   }

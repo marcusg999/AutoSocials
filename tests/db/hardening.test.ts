@@ -723,15 +723,52 @@ describe('CLASS: the enumeration each check performs is the complete one', () =>
     // So the scanned set is no longer a claim: everything our migrations add is
     // diffed against a database that has the Supabase shim and nothing else, and
     // every new object must land somewhere the checks above actually look.
+    // Each object's ACL and owner, not just its name.
+    //
+    // Diffing the SET OF OBJECTS can only ever notice something being CREATED. It
+    // is blind to a migration that modifies an object the baseline already has --
+    // and `grant select on auth.users to authenticated`, two lines in a migration,
+    // handed every user's email address to every signed-in member of every tenant
+    // while this diff stayed empty and `auth` was excluded from every other check.
+    // Verified: 109/109 green with that grant applied.
+    //
+    // So the signature includes the grants and the owner. A `GRANT`, a `REVOKE`, an
+    // `ALTER ... OWNER TO` or a `SET ROLE` that changes one now changes the
+    // signature, and the diff sees it.
     const INVENTORY = `
-      select n.nspname || '.' || c.relname as name
+      select 'schema ' || n.nspname || ' acl=' || coalesce(n.nspacl::text, '') as name
+      from pg_namespace n
+      where n.nspname not like 'pg_%' and n.nspname <> 'information_schema'
+      union all
+      select n.nspname || '.' || c.relname
+             || ' acl=' || coalesce(c.relacl::text, '')
+             || ' owner=' || pg_get_userbyid(c.relowner) as name
       from pg_class c join pg_namespace n on n.oid = c.relnamespace
       where c.relkind in ('r','p','v','m','f') and n.nspname not like 'pg_%'
         and n.nspname <> 'information_schema'
       union all
-      select n.nspname || '.' || p.proname || '()' as name
+      select n.nspname || '.' || p.proname || '()'
+             || ' acl=' || coalesce(p.proacl::text, '')
+             || ' owner=' || pg_get_userbyid(p.proowner) as name
       from pg_proc p join pg_namespace n on n.oid = p.pronamespace
-      where n.nspname not like 'pg_%' and n.nspname <> 'information_schema'`
+      where n.nspname not like 'pg_%' and n.nspname <> 'information_schema'
+      union all
+      -- Column-level grants live in pg_attribute, not in relacl.
+      select n.nspname || '.' || c.relname || '.' || a.attname
+             || ' acl=' || coalesce(a.attacl::text, '') as name
+      from pg_attribute a
+      join pg_class c on c.oid = a.attrelid
+      join pg_namespace n on n.oid = c.relnamespace
+      where a.attacl is not null and n.nspname not like 'pg_%'
+        and n.nspname <> 'information_schema'
+      union all
+      -- A trigger attached to a baseline table creates no new object either.
+      select 'trigger ' || n.nspname || '.' || c.relname || '.' || t.tgname as name
+      from pg_trigger t
+      join pg_class c on c.oid = t.tgrelid
+      join pg_namespace n on n.oid = c.relnamespace
+      where not t.tgisinternal and n.nspname not like 'pg_%'
+        and n.nspname <> 'information_schema'`
 
     const baselineUrl = await shimOnlyDatabase('postdeck_baseline')
     let baseline: Set<string>
@@ -748,13 +785,15 @@ describe('CLASS: the enumeration each check performs is the complete one', () =>
     // The schemas the checks in this file actually read. Kept as a literal list on
     // purpose: this is the one place where naming them is the POINT, because the
     // assertion is that nothing of ours lands outside them.
-    const SCANNED = ['public.', 'app.', 'extensions.']
+    const SCANNED = ['public.', 'app.', 'extensions.',
+                     'schema public ', 'schema app ', 'schema extensions ',
+                     'trigger public.', 'trigger app.', 'trigger extensions.']
     const outside = after
       .filter((name) => !baseline.has(name))
       .filter((name) => !SCANNED.some((prefix) => name.startsWith(prefix)))
 
-    expect(outside, 'our migrations created these objects in schemas no class test in this '
-      + 'file examines, so nothing checks their RLS, grants or ownership').toEqual([])
+    expect(outside, 'our migrations created or altered these objects in schemas no class test '
+      + 'in this file examines, so nothing checks their RLS, grants or ownership').toEqual([])
   })
 
   test('no rewrite RULE redirects a write past the row level security on its target', async () => {
@@ -792,23 +831,42 @@ describe('CLASS: the enumeration each check performs is the complete one', () =>
     // The premise of that check -- a definer helper is safe if nobody can call it --
     // does not hold for trigger functions, so they are held to a named list instead.
     // Adding one here is a deliberate act that says someone read what it does.
-    const REVIEWED_TRIGGER_FUNCTIONS = [
-      'app.audit_log_is_append_only',
-      'app.audit_row_change',
-      'app.pin_post_authorship',
+    // Listed as `table -> function`, because BOTH halves matter. Filtering this
+    // population by the TABLE's schema meant a definer trigger on `auth.users` --
+    // a schema every real Supabase project has, and one this list excludes -- could
+    // never appear in the enumerated set at all, so `.toEqual()` could not fail on
+    // it. Verified: the query returned exactly these three rows while a trigger
+    // `auth.users -> app.mirror_posts` sat alongside them, copying every tenant's
+    // posts into the attacker's business on each new sign-up.
+    const REVIEWED_TRIGGERS = [
+      'public.audit_log -> app.audit_log_is_append_only',
+      'public.audit_log -> app.audit_log_is_append_only',
+      'public.business_members -> app.audit_row_change',
+      'public.businesses -> app.audit_row_change',
+      'public.posts -> app.audit_row_change',
+      'public.posts -> app.pin_post_authorship',
+      'public.scheduled_posts -> app.audit_row_change',
+      'public.social_accounts -> app.audit_row_change',
     ]
     await asAdmin(url, async (q) => {
+      // The population is every non-internal trigger that either RUNS one of our
+      // functions or SITS ON one of our tables, whichever schema each is in.
+      // Supabase's own triggers run Supabase's functions on Supabase's tables, so
+      // they match neither half and are correctly left out.
       const r = await q(`
-        select distinct fn.nspname || '.' || f.proname as fn
+        select n.nspname || '.' || c.relname || ' -> ' || fn.nspname || '.' || f.proname as t
         from pg_trigger t
         join pg_class c on c.oid = t.tgrelid
         join pg_namespace n on n.oid = c.relnamespace
         join pg_proc f on f.oid = t.tgfoid
         join pg_namespace fn on fn.oid = f.pronamespace
-        where ${OUR_SCHEMAS} and not t.tgisinternal
+        where not t.tgisinternal
+          and (fn.nspname in ('app', 'public', 'extensions')
+               or n.nspname in ('app', 'public', 'extensions'))
         order by 1`)
-      expect(r.rows.map((x) => x.fn), 'a trigger function runs regardless of who may EXECUTE it, '
-        + 'so each one has to be listed here by someone who read it').toEqual(REVIEWED_TRIGGER_FUNCTIONS)
+      expect(r.rows.map((x) => x.t), 'a trigger function runs regardless of who may EXECUTE it, '
+        + 'so every trigger running our code -- or sitting on our tables -- has to be listed '
+        + 'here by someone who read it').toEqual(REVIEWED_TRIGGERS)
     })
   })
 })

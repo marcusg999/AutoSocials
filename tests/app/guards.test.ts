@@ -9,6 +9,8 @@
  */
 import { describe, expect, test } from 'vitest'
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
+
+import { closureSource } from '../../scripts/module-closure'
 import { join, relative } from 'node:path'
 
 function walk(dir: string, out: string[] = []): string[] {
@@ -332,6 +334,20 @@ describe('every server action', () => {
   // -- switchBusinessAction sets a cookie -- leaves no trigger to fire. Nothing
   // connected server actions to the audit layer at all, so that action could have
   // shipped unaudited with the whole suite green.
+  // An action's RETURN VALUE travels back to the browser inside the flight payload,
+  // and it is the one channel scripts/check-no-secrets.ts cannot read: actions are
+  // POSTed to the page they live on, the scan POSTs only route handlers, and
+  // reaching an action needs a live session plus a CSRF token. Rather than claim
+  // coverage the scan does not have, the channel is closed: every action in this
+  // phase reports outcomes by redirecting, so none of them returns anything.
+  test.each(everyAction)('%s → %s() returns nothing, so it cannot leak through the flight payload', (file, name) => {
+    const source = code(join(process.cwd(), file))
+    const signature = source.match(new RegExp(`${name}\\s*(?::[^=]*)?=?\\s*\\([^)]*\\)\\s*:\\s*([^{=]+)`))
+    expect(signature?.[1]?.trim(), `${name} must declare an explicit Promise<void> return type; `
+      + 'an action that returns a value sends it to the browser where nothing inspects it')
+      .toBe('Promise<void>')
+  })
+
   test.each(everyAction)('%s → %s() writes an audit_log row', (file, name) => {
     const body = bodyOf(join(process.cwd(), file), name)
     expect(body, `${name} mutates without recording an audit_log row`)
@@ -356,9 +372,22 @@ describe('every page', () => {
     const source = readFileSync(join(process.cwd(), file), 'utf8')
 
     if (RENDERS_NO_DATA.includes(file)) {
-      // Hold them to that promise: no database read may appear on these pages.
-      expect(source, `${file} is listed as dataless but queries the database`)
+      // Hold them to that promise across everything the page RUNS, not just the
+      // bytes in the page file. Greping the file alone certified /login as dataless
+      // while it rendered every tenant in the system to an anonymous visitor
+      // through a one-line service-role helper, with this suite at 166/166.
+      // Two different questions, so two different patterns.
+      //
+      // In the page file itself, merely CONSTRUCTING a client is suspicious.
+      // Across the import closure it is not: csrfField() builds one to bind the
+      // token to the session subject, so `createSupabase` appears in the closure of
+      // every page that renders a form. What must not appear anywhere the page runs
+      // is an actual QUERY.
+      expect(source, `${file} is listed as dataless but builds a database client`)
         .not.toMatch(/\.from\(|\.rpc\(|createSupabase/)
+      const reachable = closureSource(join(process.cwd(), file))
+      expect(reachable, `${file} is listed as dataless but it, or something it imports, `
+        + 'queries the database').not.toMatch(/\.from\(|\.rpc\(/)
       return
     }
 
