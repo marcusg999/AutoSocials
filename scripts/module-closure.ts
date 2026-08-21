@@ -56,7 +56,34 @@ function isServerActionModule(source: string): boolean {
  * specifier that resolves to nothing is simply not our code.
  */
 export function moduleClosure(entry: string, root = process.cwd()): string[] {
+  return closureOf(entry, root).files
+}
+
+/**
+ * A module specifier this resolver cannot follow, because it is not a literal:
+ * `import(someVariable)`, `require(`@/${name}`)`. There is no static answer to
+ * "what does this page run", so any claim resting on the closure is unprovable and
+ * must fail rather than pass quietly.
+ */
+function hasUnanalyzableSpecifier(source: string): boolean {
+  const code = source
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/(^|[^:])\/\/.*$/gm, '$1')
+  // The WHOLE argument must be one quoted string. Testing only the first character
+  // let `import('@/lib/repo' + 'rting')` read as a literal: the specifier regex
+  // extracted '@/lib/repo', resolved nothing, and the page was certified dataless
+  // while it rendered every tenant.
+  for (const match of code.matchAll(/(?:^|[^.\w])(?:import|require)\s*\(([^)]*)\)/gm)) {
+    if (!/^\s*(['"])[^'"]*\1\s*$/.test(match[1]!)) return true
+  }
+  return false
+}
+
+/** The closure, plus any file in it whose imports could not be followed. */
+export function closureOf(entry: string, root = process.cwd()):
+    { files: string[]; unanalyzable: string[] } {
   const seen = new Set<string>()
+  const unanalyzable: string[] = []
   const queue = [entry]
   while (queue.length) {
     const file = queue.pop()!
@@ -65,19 +92,41 @@ export function moduleClosure(entry: string, root = process.cwd()): string[] {
     // Never skip the entry itself, whatever it is.
     if (file !== entry && isServerActionModule(source)) continue
     seen.add(file)
-    // static imports, re-exports, and dynamic import() alike
+    if (hasUnanalyzableSpecifier(source)) unanalyzable.push(file)
+    // Static imports, re-exports, dynamic import() -- and require().
+    //
+    // `require` was missing, and `const { everyTenant } = require('@/lib/reporting')`
+    // on an anonymous page read every tenant in the system through the service-role
+    // client with the guard suite at 96/96. A module reached by require runs exactly
+    // like one reached by import; only this regex disagreed.
     const specifiers = [
-      ...source.matchAll(/(?:from|import)\s*\(?\s*['"]([^'"]+)['"]/g),
+      ...source.matchAll(/(?:from|import|require)\s*\(?\s*['"]([^'"]+)['"]/g),
     ].map((match) => match[1]!)
     for (const specifier of specifiers) {
       const resolved = resolveSpecifier(specifier, file, root)
       if (resolved) queue.push(resolved)
+      // A package import resolves to nothing legitimately. One of OURS that does
+      // not is a module we failed to follow, so the graph is incomplete.
+      else if (specifier.startsWith('@/') || specifier.startsWith('.')) unanalyzable.push(file)
     }
   }
-  return [...seen]
+  return { files: [...seen], unanalyzable }
 }
 
-/** The concatenated source of a file and everything it imports. */
+/**
+ * The concatenated source of a file and everything it imports.
+ *
+ * Throws when the closure contains an import this resolver cannot follow: a caller
+ * asking "does anything here query the database" must not receive a confident "no"
+ * built from an incomplete graph.
+ */
 export function closureSource(entry: string, root = process.cwd()): string {
-  return moduleClosure(entry, root).map((file) => readFileSync(file, 'utf8')).join('\n')
+  const { files, unanalyzable } = closureOf(entry, root)
+  if (unanalyzable.length > 0) {
+    throw new Error(
+      `cannot determine what ${entry} runs: ${unanalyzable.join(', ')} import(s) a `
+      + 'computed specifier, so the module graph is incomplete. Use a literal import.',
+    )
+  }
+  return files.map((file) => readFileSync(file, 'utf8')).join('\n')
 }

@@ -1173,6 +1173,58 @@ action in this phase reports its outcome by redirecting, and a test requires eac
 to declare `Promise<void>`. Confirmed falsifiable — changing one action to
 `Promise<string>` fails it.
 
+### G91 — The ninth variant: `require()` is an import too
+
+G89 made the "this page is dataless" claim read the transitive import closure.
+Round 9's brief predicted a ninth variant of the same defect and named the place to
+look. It was there:
+
+```ts
+const specifiers = [...source.matchAll(/(?:from|import)\s*\(?\s*['"]([^'"]+)['"]/g)]
+```
+
+`require` is missing. `const { everyTenant } = require('@/lib/reporting')` on an
+anonymous page read every tenant in the system through the service-role client with
+the guard suite at **96/96**. A module reached by `require` runs exactly like one
+reached by `import`; only the regex disagreed.
+
+Two more holes surfaced while fixing it, both worse than the first because they fail
+*silently* rather than by omission:
+
+- **A computed specifier.** My first fix rejected an argument whose first character
+  was not a quote. `import('@/lib/repo' + 'rting')` starts with a quote, so it read
+  as literal, the specifier regex extracted `@/lib/repo`, that resolved to nothing,
+  and the page was certified dataless again — **96/96**. The whole argument has to be
+  a single quoted string, not merely start like one.
+- **A specifier of ours that resolves to nothing.** A package import legitimately
+  resolves to nothing. One starting `@/` or `.` that does not is a module we failed
+  to follow, and silently treating it as absent is how the above stayed green.
+
+Both now mark the closure incomplete, and `closureSource` **throws** rather than
+return a partial graph: a caller asking "does anything here query the database" must
+never get a confident no built from modules that were never read.
+
+The general form, which is the same one G79 stated and the loop keeps re-deriving:
+an incomplete model must fail, not return its incomplete answer.
+
+### G92 — `freshDatabase()` does not isolate roles, because roles are cluster-wide
+
+While attacking the round-8 fixes I ran a probe migration containing
+`grant service_role to authenticated`. The suite correctly went red. But roles in
+PostgreSQL are **cluster** objects, not database objects, so dropping and recreating
+the scratch database did not undo the grant: every later run inherited it, and
+`npm run verify` came back **15 failed / 265 passed** on a tree whose only change was
+a comment. It took a moment to realise the failures were mine and not the code's.
+
+Two things follow. For anyone probing this suite: a migration that touches a ROLE,
+a TABLESPACE, or anything else outside the database leaves state behind that
+`freshDatabase()` cannot clean, so undo it by hand. And more usefully — this is the
+one privilege change the class tests genuinely cannot see, because the object it
+alters is not in the database being snapshotted. It is caught today only
+behaviourally, by the audit tests noticing that `authenticated` suddenly holds
+privileges it should not. That is a real check, but an indirect one, and it is
+recorded here rather than dressed up as coverage.
+
 ## Known, accepted limitations
 
 Stated plainly rather than left to be discovered.
