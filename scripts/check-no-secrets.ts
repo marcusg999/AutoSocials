@@ -303,9 +303,15 @@ function datalessRoutes(): Set<string> {
     // helper one import away served every tenant to an anonymous visitor.
     const own = readFileSync(file, 'utf8')
     if (/supabase|resolveSessionState|requireMfaSession|requireSignedInUser/.test(own)) continue
-    // Across the closure only an actual query counts: `supabase` appears in the
-    // closure of every page that renders a form, via csrfField().
-    if (/\.from\(|\.rpc\(/.test(closureSource(file, ROOT))) continue
+    // Across the closure, `supabase` appears on every page that renders a form via
+    // csrfField(), so it cannot be the signal. `.from(`/`.rpc(` was the signal, and
+    // it is a model of supabase-js rather than of reading data -- a raw fetch to
+    // PostgREST with the service-role key matched neither and served every tenant
+    // with this scan reporting 9/9. Anything that reaches the network or a database
+    // driver now disqualifies the claim; closureSource throws if the graph is
+    // incomplete, so this reads every module the page actually runs.
+    if (/\.from\(|\.rpc\(|\bfetch\(|from ['"]pg['"]|from ['"]postgres['"]/
+        .test(closureSource(file, ROOT))) continue
     const key = '/' + relative(appDir, file).replace(/\/?page\.(m|c)?[jt]sx?$/, '')
     dataless.add(fillDynamicSegments(key))
   }

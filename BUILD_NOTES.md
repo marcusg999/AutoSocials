@@ -1225,6 +1225,79 @@ behaviourally, by the audit tests noticing that `authenticated` suddenly holds
 privileges it should not. That is a real check, but an indirect one, and it is
 recorded here rather than dressed up as coverage.
 
+### G93 — The tenth variant, and the accounting that should have been there all along
+
+Round 10 found three more misses in `scripts/module-closure.ts` — the file written
+to close round 9's finding, which was itself in the file written to close round 8's.
+Two rounds running, the defect was in the fix for the previous defect.
+
+- **A comment between `import(` and its specifier.** The extractor read RAW source
+  and needed the quote to follow the paren; `hasUnanalyzableSpecifier` read
+  COMMENT-STRIPPED source and saw one clean string. So
+  `import(/* webpackChunkName: "reporting" */ '@/lib/reporting')` was neither
+  followed nor flagged — **96/96 green**, anonymous `/login` serving every tenant.
+  `/* webpackChunkName */` is an ordinary idiom, not an exotic shape.
+- **A `baseUrl` import.** `tsconfig.json` sets `"baseUrl": "."`, so
+  `import { everyTenant } from 'lib/reporting'` is OURS. `resolveSpecifier` knew only
+  `@/` and `.`, returned null, and the caller read null as "a node_modules package".
+  Round 9's fail-closed rule only covered `@/`- and `.`-prefixed specifiers, so it
+  did not apply. **Full `npm run verify` green — 281 tests, 9/9 secret checks.**
+- **`/\.from\(|\.rpc\(/` is a model of supabase-js, not of reading data.** A raw
+  `fetch()` to PostgREST with the service-role key matches neither, and neither did
+  the page's own-source ban. Same leak, **281/281 green**.
+
+The first two fail SILENTLY, which is worse than the omission G91 fixed.
+
+**The fix is not a wider regex.** The critic's diagnosis was exact: `closureOf`
+returned a file list with no accounting of how many import sites it had seen. So it
+now counts them — every syntactic site that can pull in a module, against every
+specifier actually extracted — and reports an incomplete graph when the two disagree,
+*whatever the reason, including one nobody has thought of yet*. Extraction and the
+unanalyzable check now read the same comment-stripped source. `isPackage()` asks
+whether the package exists in `node_modules` (or is a Node builtin) instead of
+inferring it from a prefix.
+
+And the dataless claim stopped using a pattern at all. There is no finite list of
+ways to read data — `pg`, `supabase.auth.admin`, a route handler imported and called
+— so `DATALESS_PAGE_CLOSURES` enumerates the exact set of modules each such page
+runs, and anything new in that set fails until a person reads it. That is sound only
+because the graph is now provably complete; as a pair, the enumeration and the
+accounting are what the previous three fixes were missing.
+
+### G94 — A `Promise<void>` annotation is a claim about the declaration, not the value
+
+G90 closed the flight-payload channel by requiring every action to declare
+`Promise<void>`. `as any` is assignable to `void`, so this typechecks, the annotation
+still reads `Promise<void>`, and the object ships:
+
+```ts
+return { leaked_database_url: process.env.DATABASE_URL,
+         leaked_service_role_key: process.env.SUPABASE_SERVICE_ROLE_KEY } as any
+```
+
+Round 10 proved it on the wire with a real server-action POST, correct React reply
+encoding, and both secrets in the response body — with `npm run verify` at **exit 0**.
+Quality bar 2 was false while every check reported success.
+
+The body is now checked as well as the signature: an action may `return` to exit
+early, but never a value. The general lesson is the same one G93 states — a type
+annotation is a claim, and a test that reads the claim is not testing the thing.
+
+### G95 — `tgenabled` is not `exists`
+
+The audit-coverage class test asked whether a trigger row existed. `ALTER TABLE
+public.businesses DISABLE TRIGGER audit_changes` leaves the row in `pg_trigger` with
+`tgenabled = 'D'`, so the answer stayed yes while insert, update and delete produced
+**zero** audit rows — 280/280 green, bar 4 false for that table. The same ALTER on
+`posts` was caught, but only because `audit.test.ts` happens to exercise posts
+behaviourally; real coverage was exactly the set of tables someone had written a
+behavioural test for.
+
+The check now requires `tgenabled in ('O','A','R')`, and the baseline signature
+carries it too, so disabling a trigger changes the snapshot. (`tgenabled` is
+PostgreSQL's `"char"` type — it needs an explicit `::text` cast to concatenate, and
+without it the query fails with `operator is not unique: text || "char"`.)
+
 ## Known, accepted limitations
 
 Stated plainly rather than left to be discovered.

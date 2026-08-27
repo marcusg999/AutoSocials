@@ -11,15 +11,40 @@
  */
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
+import { builtinModules } from 'node:module'
 
 const EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.mts', '.cts', '.mjs', '.cjs']
 
 /** Resolves one import specifier to a file on disk, or null if it is a package. */
 function resolveSpecifier(specifier: string, fromFile: string, root: string): string | null {
-  let base: string
-  if (specifier.startsWith('@/')) base = join(root, specifier.slice(2))
-  else if (specifier.startsWith('.')) base = resolve(dirname(fromFile), specifier)
-  else return null // a node_modules package: not our code
+  const candidates: string[] = []
+  if (specifier.startsWith('@/')) candidates.push(join(root, specifier.slice(2)))
+  else if (specifier.startsWith('.')) candidates.push(resolve(dirname(fromFile), specifier))
+  // tsconfig sets "baseUrl": ".", so `import { x } from 'lib/reporting'` is OURS and
+  // resolves from the project root. Treating every non-@/ non-relative specifier as a
+  // node_modules package dropped it silently -- npm run verify was green, 281 tests
+  // passing, while an anonymous /login served every tenant through that import.
+  else candidates.push(join(root, specifier))
+
+  for (const base of candidates) {
+    const hit = resolveFrom(base)
+    if (hit) return hit
+  }
+  return null
+}
+
+/** True when a specifier really is a node_modules package, rather than merely unresolved. */
+export function isPackage(specifier: string, root: string): boolean {
+  if (specifier.startsWith('@/') || specifier.startsWith('.')) return false
+  // Node builtins are packages that live in no directory.
+  if (specifier.startsWith('node:') || builtinModules.includes(specifier)) return true
+  const name = specifier.startsWith('@')
+    ? specifier.split('/').slice(0, 2).join('/')
+    : specifier.split('/')[0]!
+  return existsSync(join(root, 'node_modules', name))
+}
+
+function resolveFrom(base: string): string | null {
 
   for (const extension of EXTENSIONS) {
     if (existsSync(base + extension)) return base + extension
@@ -65,10 +90,13 @@ export function moduleClosure(entry: string, root = process.cwd()): string[] {
  * "what does this page run", so any claim resting on the closure is unprovable and
  * must fail rather than pass quietly.
  */
-function hasUnanalyzableSpecifier(source: string): boolean {
-  const code = source
-    .replace(/\/\*[\s\S]*?\*\//g, '')
+function stripComments(source: string): string {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
     .replace(/(^|[^:])\/\/.*$/gm, '$1')
+}
+
+function hasUnanalyzableSpecifier(code: string): boolean {
   // The WHOLE argument must be one quoted string. Testing only the first character
   // let `import('@/lib/repo' + 'rting')` read as a literal: the specifier regex
   // extracted '@/lib/repo', resolved nothing, and the page was certified dataless
@@ -88,10 +116,18 @@ export function closureOf(entry: string, root = process.cwd()):
   while (queue.length) {
     const file = queue.pop()!
     if (seen.has(file) || !existsSync(file)) continue
-    const source = readFileSync(file, 'utf8')
+    const raw = readFileSync(file, 'utf8')
     // Never skip the entry itself, whatever it is.
-    if (file !== entry && isServerActionModule(source)) continue
+    if (file !== entry && isServerActionModule(raw)) continue
     seen.add(file)
+
+    // Read the COMMENT-STRIPPED source. Extracting from raw source while the
+    // unanalyzable check read stripped source was a silent miss in both directions:
+    // `import(/* webpackChunkName: "reporting" */ '@/lib/reporting')` was not matched
+    // by the extractor (the quote does not follow the paren) and not flagged by the
+    // checker (stripped, the argument is one clean string). The module was neither
+    // followed nor reported, and an anonymous /login served every tenant at 96/96.
+    const source = stripComments(raw)
     if (hasUnanalyzableSpecifier(source)) unanalyzable.push(file)
     // Static imports, re-exports, dynamic import() -- and require().
     //
@@ -102,12 +138,22 @@ export function closureOf(entry: string, root = process.cwd()):
     const specifiers = [
       ...source.matchAll(/(?:from|import|require)\s*\(?\s*['"]([^'"]+)['"]/g),
     ].map((match) => match[1]!)
+
+    // THE ACCOUNTING. Nine rounds found nine narrower-than-the-population regexes,
+    // and each fix widened the regex. This counts instead: every syntactic site that
+    // can pull in a module, against every specifier actually extracted. If a site
+    // produced no specifier, this model of the file is incomplete -- whatever the
+    // reason, including one nobody has thought of yet -- and it says so rather than
+    // returning a shorter list. That is the property the previous fixes lacked.
+    const sites = [...source.matchAll(/(?:^|[^.\w])(?:import|require)\s*\(|\bfrom\s*['"]|(?:^|[^.\w])import\s+['"]/gm)]
+    if (sites.length !== specifiers.length) unanalyzable.push(file)
+
     for (const specifier of specifiers) {
       const resolved = resolveSpecifier(specifier, file, root)
       if (resolved) queue.push(resolved)
-      // A package import resolves to nothing legitimately. One of OURS that does
-      // not is a module we failed to follow, so the graph is incomplete.
-      else if (specifier.startsWith('@/') || specifier.startsWith('.')) unanalyzable.push(file)
+      // Unresolved is only acceptable when the specifier is genuinely a package on
+      // disk. "Does not start with @/ or ." is not the same as "is a package".
+      else if (!isPackage(specifier, root)) unanalyzable.push(file)
     }
   }
   return { files: [...seen], unanalyzable }

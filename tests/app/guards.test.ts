@@ -10,7 +10,7 @@
 import { describe, expect, test } from 'vitest'
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 
-import { closureSource } from '../../scripts/module-closure'
+import { closureSource, moduleClosure } from '../../scripts/module-closure'
 import { join, relative } from 'node:path'
 
 function walk(dir: string, out: string[] = []): string[] {
@@ -346,6 +346,18 @@ describe('every server action', () => {
     expect(signature?.[1]?.trim(), `${name} must declare an explicit Promise<void> return type; `
       + 'an action that returns a value sends it to the browser where nothing inspects it')
       .toBe('Promise<void>')
+
+    // The declaration is not the value. `return { ... } as any` is assignable to
+    // void, so it typechecks, the annotation still reads Promise<void>, and the
+    // object ships in the flight reply -- DATABASE_URL and the service-role key were
+    // delivered to a real POST with npm run verify at exit 0. So the BODY is checked
+    // too: an action may `return` to exit early, but never a value.
+    const body = bodyOf(join(process.cwd(), file), name)
+    const valued = [...body.matchAll(/\breturn\b([^\n;}]*)/g)]
+      .filter((m) => m[1]!.trim() !== '')
+    expect(valued.map((m) => `return${m[1]}`), `${name} returns a value. Actions report `
+      + 'outcomes by redirecting; a returned value reaches the browser through the flight '
+      + 'payload, which the secret scan cannot read').toEqual([])
   })
 
   test.each(everyAction)('%s → %s() writes an audit_log row', (file, name) => {
@@ -364,6 +376,23 @@ describe('every page', () => {
   // Anything added here must be genuinely dataless — a form or a redirect.
   const RENDERS_NO_DATA = ['app/login/page.tsx', 'app/page.tsx']
 
+  // Every module each dataless page actually runs, read and confirmed to read no
+  // tenant data. `csrfField()` reaches the session and Supabase modules to bind the
+  // CSRF token to the signed-in subject; none of them queries a table.
+  const DATALESS_PAGE_CLOSURES: Record<string, string[]> = {
+    'app/login/page.tsx': [
+      'app/login/page.tsx',
+      'lib/env.ts',
+      'lib/security/csrf-token.ts',
+      'lib/security/csrf.ts',
+      'lib/security/routes.ts',
+      'lib/security/scan-mode.ts',
+      'lib/security/session.ts',
+      'lib/supabase/server.ts',
+    ],
+    'app/page.tsx': ['app/page.tsx', 'lib/security/routes.ts'],
+  }
+
   test('there is at least one page to check', () => {
     expect(pageFiles.length).toBeGreaterThan(0)
   })
@@ -376,18 +405,30 @@ describe('every page', () => {
       // bytes in the page file. Greping the file alone certified /login as dataless
       // while it rendered every tenant in the system to an anonymous visitor
       // through a one-line service-role helper, with this suite at 166/166.
-      // Two different questions, so two different patterns.
+      // In the page file itself, merely CONSTRUCTING a client or reaching the
+      // network is suspicious. `fetch(` is here because `.from(`/`.rpc(` is a model
+      // of supabase-js, not of reading data: a raw fetch to PostgREST with the
+      // service-role key matched neither, and served every tenant at 281/281 green.
+      expect(source, `${file} is listed as dataless but reads data`)
+        .not.toMatch(/\.from\(|\.rpc\(|createSupabase|\bfetch\(/)
+
+      // Across the closure, an ENUMERATION rather than a pattern.
       //
-      // In the page file itself, merely CONSTRUCTING a client is suspicious.
-      // Across the import closure it is not: csrfField() builds one to bind the
-      // token to the session subject, so `createSupabase` appears in the closure of
-      // every page that renders a form. What must not appear anywhere the page runs
-      // is an actual QUERY.
-      expect(source, `${file} is listed as dataless but builds a database client`)
-        .not.toMatch(/\.from\(|\.rpc\(|createSupabase/)
-      const reachable = closureSource(join(process.cwd(), file))
-      expect(reachable, `${file} is listed as dataless but it, or something it imports, `
-        + 'queries the database').not.toMatch(/\.from\(|\.rpc\(/)
+      // Every pattern tried here has been a model of one library: .from(/.rpc( for
+      // supabase-js, missing raw fetch, and it would equally miss a `pg` client,
+      // supabase.auth.admin, or a route handler imported and called. There is no
+      // finite list of ways to read data, so this asserts the opposite thing -- the
+      // exact set of modules the page runs. Anything new in that set, reading data
+      // by any means whatsoever, fails until a person reviews it and updates the
+      // list. That is sound only because closureOf now proves the graph is complete
+      // (it counts import sites against specifiers resolved) rather than returning a
+      // short list when it fails to follow something.
+      const reachable = moduleClosure(join(process.cwd(), file))
+        .map((f) => relative(process.cwd(), f)).sort()
+      expect(reachable, `the set of modules ${file} runs has changed. It is listed as `
+        + 'rendering no data, and that claim covers everything it imports — read the new '
+        + 'module and update DATALESS_PAGE_CLOSURES if it genuinely reads nothing')
+        .toEqual(DATALESS_PAGE_CLOSURES[file])
       return
     }
 

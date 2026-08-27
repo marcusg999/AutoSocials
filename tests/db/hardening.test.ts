@@ -568,6 +568,13 @@ describe('CLASS: every business-scoped table is audited', () => {
                exists (
                  select 1 from pg_trigger t
                  where t.tgrelid = c.oid and not t.tgisinternal and t.tgname = 'audit_changes'
+                   -- ENABLED, not merely present. Disabling a trigger with
+                   -- ALTER TABLE leaves the row in pg_trigger with
+                   -- tgenabled='D', so an existence check still says yes while insert,
+                   -- update and delete all produce zero audit rows -- verified at
+                   -- 280/280 green. Bar 4's structural guarantee has to be about
+                   -- whether the trigger FIRES. 'O' origin, 'A' always, 'R' replica.
+                   and t.tgenabled in ('O', 'A', 'R')
                ) as has_audit_trigger
         from pg_class c
         join pg_namespace n on n.oid = c.relnamespace
@@ -763,7 +770,8 @@ describe('CLASS: the enumeration each check performs is the complete one', () =>
         and n.nspname <> 'information_schema'
       union all
       -- A trigger attached to a baseline table creates no new object either.
-      select 'trigger ' || n.nspname || '.' || c.relname || '.' || t.tgname as name
+      select 'trigger ' || n.nspname || '.' || c.relname || '.' || t.tgname
+             || ' enabled=' || t.tgenabled::text as name
       from pg_trigger t
       join pg_class c on c.oid = t.tgrelid
       join pg_namespace n on n.oid = c.relnamespace
