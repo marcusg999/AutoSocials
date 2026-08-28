@@ -420,9 +420,12 @@ describe('every page', () => {
       // finite list of ways to read data, so this asserts the opposite thing -- the
       // exact set of modules the page runs. Anything new in that set, reading data
       // by any means whatsoever, fails until a person reviews it and updates the
-      // list. That is sound only because closureOf now proves the graph is complete
-      // (it counts import sites against specifiers resolved) rather than returning a
-      // short list when it fails to follow something.
+      // list. That is sound only because moduleClosure THROWS when the graph is
+      // incomplete -- it counts import sites against specifiers resolved, and refuses
+      // to hand back a file list it cannot vouch for. An earlier version of this
+      // comment claimed the same soundness while moduleClosure quietly discarded that
+      // accounting and returned the short list anyway, which is exactly how a
+      // computed dynamic import served every tenant here at 96/96.
       const reachable = moduleClosure(join(process.cwd(), file))
         .map((f) => relative(process.cwd(), f)).sort()
       expect(reachable, `the set of modules ${file} runs has changed. It is listed as `

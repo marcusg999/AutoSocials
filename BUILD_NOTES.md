@@ -1298,6 +1298,49 @@ carries it too, so disabling a trigger changes the snapshot. (`tgenabled` is
 PostgreSQL's `"char"` type — it needs an explicit `::text` cast to concatenate, and
 without it the query fails with `operator is not unique: text || "char"`.)
 
+### G96 — The proof was computed and then thrown away
+
+Round 10's diagnosis was that `closureOf` returned a file list with no accounting of
+how many import sites it had seen. G93 added exactly that accounting. Round 11 found
+that `closureOf` has **two** consumers and only one was wired to it:
+
+```ts
+export function moduleClosure(entry, root) {
+  return closureOf(entry, root).files      // .unanalyzable dropped on the floor
+}
+```
+
+`closureSource` threw correctly. But the dataless-page guard calls **`moduleClosure`**,
+so the completeness proof was computed and discarded before it reached the one check
+that certifies a page reads no tenant data. A computed dynamic import walked straight
+through: **96/96 guards, 281 tests, 9/9 secret checks, exit 0**, with an anonymous
+`GET /login` serving every tenant. The page file contained no `fetch(`, no `.from(`,
+no `createSupabase` — the page-source ban was satisfied honestly. The break was
+entirely in the accounting not reaching the guard.
+
+Worse, the comment in that test said the check "is sound only because closureOf now
+proves the graph is complete … rather than returning a short list when it fails to
+follow something" — and `moduleClosure` returned precisely that short list when it
+failed to follow something. The comment was true of `closureOf` and false of the
+function the test actually called.
+
+There is now one `assertComplete()` gate, and no way to read the files without
+passing it. The lesson is narrower and more useful than "widen the regex": **a check
+is only as good as its narrowest consumer.** Adding a proof is half the work;
+verifying every caller is forced through it is the other half, and it is the half
+that was missing in three consecutive rounds of fixes to this one file.
+
+Also closed, both found by round 11 probing the site-counting regex directly:
+`new Worker(new URL('./x', import.meta.url))` and
+`createRequire(import.meta.url)('./x')` load a module with no `import(`/`require(`
+token, so they produce neither a site nor a specifier — the counts agree and the
+module vanishes. Neither is a normal server-component data path, so their presence
+alone now marks the graph incomplete rather than being resolved.
+
+And in `scripts/check-no-secrets.ts`, `datalessRoutes()` filtered on RAW source, so
+the word "supabase" in a **code comment** was enough to skip the closure check
+entirely. It reads comment-stripped source now, like everything else here.
+
 ## Known, accepted limitations
 
 Stated plainly rather than left to be discovered.

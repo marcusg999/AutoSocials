@@ -81,7 +81,33 @@ function isServerActionModule(source: string): boolean {
  * specifier that resolves to nothing is simply not our code.
  */
 export function moduleClosure(entry: string, root = process.cwd()): string[] {
-  return closureOf(entry, root).files
+  const { files, unanalyzable } = closureOf(entry, root)
+  assertComplete(entry, unanalyzable)
+  return files
+}
+
+/**
+ * The single gate every caller passes through.
+ *
+ * closureOf had TWO consumers and only closureSource was wired to the accounting;
+ * moduleClosure returned a bare `.files` list and dropped `unanalyzable` on the
+ * floor. The dataless-page guard calls moduleClosure, so the completeness proof was
+ * computed and then thrown away before it reached the one check that certifies a
+ * page reads no tenant data -- and a computed dynamic import walked straight
+ * through: 96/96 guards, 281 tests, 9/9 secret checks, exit 0, with an anonymous
+ * /login serving every tenant.
+ *
+ * The detection generalised; the propagation did not. So there is now exactly one
+ * place that decides what an incomplete graph means, and no way to read the files
+ * without passing it.
+ */
+function assertComplete(entry: string, unanalyzable: string[]): void {
+  if (unanalyzable.length === 0) return
+  throw new Error(
+    `cannot determine what ${entry} runs: ${[...new Set(unanalyzable)].join(', ')} `
+    + 'import(s) a module this resolver cannot follow, so the module graph is '
+    + 'incomplete. Use a literal import.',
+  )
 }
 
 /**
@@ -145,7 +171,14 @@ export function closureOf(entry: string, root = process.cwd()):
     // produced no specifier, this model of the file is incomplete -- whatever the
     // reason, including one nobody has thought of yet -- and it says so rather than
     // returning a shorter list. That is the property the previous fixes lacked.
-    const sites = [...source.matchAll(/(?:^|[^.\w])(?:import|require)\s*\(|\bfrom\s*['"]|(?:^|[^.\w])import\s+['"]/gm)]
+    const sites = [...source.matchAll(
+      /(?:^|[^.\w])(?:import|require)\s*\(|\bfrom\s*['"]|(?:^|[^.\w])import\s+['"]/gm)]
+    // Two constructs load a module with NO import(/require( token, so they produce
+    // neither a site nor a specifier -- the counts agree and the module vanishes.
+    // Neither is a normal server-component data path, so rather than try to resolve
+    // them, their presence alone means we cannot claim to know what this file runs.
+    const opaqueLoaders = [...source.matchAll(/new\s+Worker\s*\(|createRequire\s*\(/g)]
+    if (opaqueLoaders.length > 0) unanalyzable.push(file)
     if (sites.length !== specifiers.length) unanalyzable.push(file)
 
     for (const specifier of specifiers) {
@@ -168,11 +201,6 @@ export function closureOf(entry: string, root = process.cwd()):
  */
 export function closureSource(entry: string, root = process.cwd()): string {
   const { files, unanalyzable } = closureOf(entry, root)
-  if (unanalyzable.length > 0) {
-    throw new Error(
-      `cannot determine what ${entry} runs: ${unanalyzable.join(', ')} import(s) a `
-      + 'computed specifier, so the module graph is incomplete. Use a literal import.',
-    )
-  }
+  assertComplete(entry, unanalyzable)
   return files.map((file) => readFileSync(file, 'utf8')).join('\n')
 }

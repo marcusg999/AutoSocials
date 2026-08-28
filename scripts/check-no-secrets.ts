@@ -301,7 +301,12 @@ function datalessRoutes(): Set<string> {
     // supabase.auth -- so a page that never rendered was written off as having
     // nothing to render; and reading only the page file excused /login while a
     // helper one import away served every tenant to an anonymous visitor.
+    // Comment-stripped: the word "supabase" in a CODE COMMENT was enough to skip the
+    // closure check entirely, so a page could be excused from the expensive, correct
+    // check by a passing mention of it in prose.
     const own = readFileSync(file, 'utf8')
+      .replace(/\/\*[\s\S]*?\*\//g, ' ')
+      .replace(/(^|[^:])\/\/.*$/gm, '$1')
     if (/supabase|resolveSessionState|requireMfaSession|requireSignedInUser/.test(own)) continue
     // Across the closure, `supabase` appears on every page that renders a form via
     // csrfField(), so it cannot be the signal. `.from(`/`.rpc(` was the signal, and
