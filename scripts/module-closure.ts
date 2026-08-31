@@ -12,10 +12,15 @@
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { builtinModules } from 'node:module'
+import ts from 'typescript'
 
 const EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.mts', '.cts', '.mjs', '.cjs']
 
 /** Resolves one import specifier to a file on disk, or null if it is a package. */
+export function resolveLocal(specifier: string, fromFile: string, root = process.cwd()): string | null {
+  return resolveSpecifier(specifier, fromFile, root)
+}
+
 function resolveSpecifier(specifier: string, fromFile: string, root: string): string | null {
   const candidates: string[] = []
   if (specifier.startsWith('@/')) candidates.push(join(root, specifier.slice(2)))
@@ -59,22 +64,54 @@ function resolveFrom(base: string): string | null {
 }
 
 /**
- * True when the whole module is a server-action module -- its FIRST statement is
- * the 'use server' directive.
+ * Whether a module's FIRST statement is the 'use server' directive, decided on the
+ * parsed syntax tree rather than by stripping comments and matching a prefix.
  *
- * Such a module is a separate entry point: nothing in it runs while the importing
- * page renders, it is reached only by a POST, and every export in it is checked for
- * CSRF, session and audit by tests/app/guards.test.ts. Following a page into its own
- * actions file would make every page that has a form look like it queries at render
- * time. A file with an INLINE 'use server' inside a function body is not this -- the
- * directive is not first -- so it stays in the closure and is read.
+ * Exported so callers can reason about action modules explicitly instead of this
+ * file silently deleting them from the graph.
  */
-function isServerActionModule(source: string): boolean {
-  const firstStatement = source
-    .replace(/^\s*(\/\*[\s\S]*?\*\/|\/\/.*$)\s*/gm, '')
-    .trimStart()
-  return /^['"]use server['"]/.test(firstStatement)
+export function moduleKind(source: string): 'server-action' | 'ordinary' {
+  const parsed = ts.createSourceFile('probe.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
+  const first = parsed.statements[0]
+  if (first && ts.isExpressionStatement(first) && ts.isStringLiteral(first.expression)
+      && first.expression.text === 'use server') {
+    return 'server-action'
+  }
+  return 'ordinary'
 }
+
+/**
+ * True when any import()/require() call takes something other than a single string
+ * literal. preProcessFile silently returns the literal head of a concatenation, so
+ * without this `import('@/a' + 'b')` would resolve to the wrong module and the graph
+ * would look complete.
+ */
+function hasComputedSpecifier(source: string, fileName: string): boolean {
+  const parsed = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
+  let computed = false
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node)) {
+      const callee = node.expression
+      const isLoader = callee.kind === ts.SyntaxKind.ImportKeyword
+        || (ts.isIdentifier(callee) && callee.text === 'require')
+      if (isLoader) {
+        const arg = node.arguments[0]
+        if (!arg || !ts.isStringLiteral(arg)) computed = true
+      }
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(parsed)
+  return computed
+}
+
+/** Modules that can load code without naming it in an import. */
+const OPAQUE_LOADERS = new Set([
+  'node:worker_threads', 'worker_threads',
+  'node:module', 'module',
+  'node:vm', 'vm',
+  'node:child_process', 'child_process',
+])
 
 /**
  * The file plus every local module reachable from it. Cycles terminate; a
@@ -143,43 +180,40 @@ export function closureOf(entry: string, root = process.cwd()):
     const file = queue.pop()!
     if (seen.has(file) || !existsSync(file)) continue
     const raw = readFileSync(file, 'utf8')
-    // Never skip the entry itself, whatever it is.
-    if (file !== entry && isServerActionModule(raw)) continue
+    const kind = moduleKind(raw)
+
+    // A 'use server' module IS followed. The old code dropped it before any
+    // accounting ran -- no site, no specifier, no error -- on the premise that
+    // "nothing in it runs while the importing page renders". That premise is false
+    // twice over: module-level statements execute at import, and an exported action
+    // is an ordinary async function a page may call inline. A zero-export module
+    // starting with 'use server' satisfied every action check vacuously and served
+    // every tenant from an anonymous /login at 285/285 green.
     seen.add(file)
 
-    // Read the COMMENT-STRIPPED source. Extracting from raw source while the
-    // unanalyzable check read stripped source was a silent miss in both directions:
-    // `import(/* webpackChunkName: "reporting" */ '@/lib/reporting')` was not matched
-    // by the extractor (the quote does not follow the paren) and not flagged by the
-    // checker (stripped, the argument is one clean string). The module was neither
-    // followed nor reported, and an anonymous /login served every tenant at 96/96.
-    const source = stripComments(raw)
-    if (hasUnanalyzableSpecifier(source)) unanalyzable.push(file)
-    // Static imports, re-exports, dynamic import() -- and require().
+    // EXTRACTION IS NOW THE COMPILER'S JOB, NOT A REGEX'S.
     //
-    // `require` was missing, and `const { everyTenant } = require('@/lib/reporting')`
-    // on an anonymous page read every tenant in the system through the service-role
-    // client with the guard suite at 96/96. A module reached by require runs exactly
-    // like one reached by import; only this regex disagreed.
-    const specifiers = [
-      ...source.matchAll(/(?:from|import|require)\s*\(?\s*['"]([^'"]+)['"]/g),
-    ].map((match) => match[1]!)
+    // Four rounds widened a regex that stood in for "what modules does this file
+    // pull in", and each round found the next gap: require, a webpack magic comment,
+    // a tsconfig baseUrl specifier, `Buffer.from('x','utf8')` mistaken for an import.
+    // TypeScript is already a dependency and already answers this question exactly,
+    // so ask it. preProcessFile understands import, export-from, import-equals,
+    // require and dynamic import, and returns nothing for member calls named `from`
+    // or for the string "import 'x'" inside a JSX attribute.
+    const preprocessed = ts.preProcessFile(raw, true, true)
+    const specifiers = preprocessed.importedFiles.map((f) => f.fileName)
 
-    // THE ACCOUNTING. Nine rounds found nine narrower-than-the-population regexes,
-    // and each fix widened the regex. This counts instead: every syntactic site that
-    // can pull in a module, against every specifier actually extracted. If a site
-    // produced no specifier, this model of the file is incomplete -- whatever the
-    // reason, including one nobody has thought of yet -- and it says so rather than
-    // returning a shorter list. That is the property the previous fixes lacked.
-    const sites = [...source.matchAll(
-      /(?:^|[^.\w])(?:import|require)\s*\(|\bfrom\s*['"]|(?:^|[^.\w])import\s+['"]/gm)]
-    // Two constructs load a module with NO import(/require( token, so they produce
-    // neither a site nor a specifier -- the counts agree and the module vanishes.
-    // Neither is a normal server-component data path, so rather than try to resolve
-    // them, their presence alone means we cannot claim to know what this file runs.
-    const opaqueLoaders = [...source.matchAll(/new\s+Worker\s*\(|createRequire\s*\(/g)]
-    if (opaqueLoaders.length > 0) unanalyzable.push(file)
-    if (sites.length !== specifiers.length) unanalyzable.push(file)
+    // preProcessFile returns the literal HEAD of a concatenated specifier
+    // (`import('@/a' + 'b')` yields '@/a'), which would silently resolve to the
+    // wrong module, so a non-literal argument is still detected -- on the AST now,
+    // not by counting regex matches.
+    if (hasComputedSpecifier(raw, file)) unanalyzable.push(file)
+
+    // Some modules can load code without naming it in an import: worker threads,
+    // createRequire, vm, child processes. Aliasing defeated the old name-matching
+    // (`new wt.Worker(...)`, `createRequire as cr`), so the test is now on the
+    // IMPORT rather than the call site, which no alias can hide.
+    if (specifiers.some((m) => OPAQUE_LOADERS.has(m))) unanalyzable.push(file)
 
     for (const specifier of specifiers) {
       const resolved = resolveSpecifier(specifier, file, root)

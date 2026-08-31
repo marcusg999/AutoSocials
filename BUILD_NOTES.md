@@ -1341,6 +1341,83 @@ And in `scripts/check-no-secrets.ts`, `datalessRoutes()` filtered on RAW source,
 the word "supabase" in a **code comment** was enough to skip the closure check
 entirely. It reads comment-stripped source now, like everything else here.
 
+### G97 — Stop grepping for imports. Ask the compiler.
+
+Four rounds widened a regex that stood in for the question *"what modules does this
+file pull in"*, and each round found the next gap: `require` (G91), a webpack magic
+comment and a tsconfig `baseUrl` specifier (G93), then a **false positive** —
+`Buffer.from('postdeck.csrf.v1', 'utf8')` in an honest module made the completeness
+gate throw with a message telling the engineer to "use a literal import" in a file
+that has none. A check that cries wolf is one somebody eventually weakens.
+
+TypeScript is already a dependency and already answers this question exactly.
+`ts.preProcessFile()` understands `import`, `export … from`, `import x = require()`,
+`require()` and dynamic `import()`, and returns **nothing** for `Buffer.from`,
+`c.from('t')`, or the string `import 'x'` inside a JSX attribute. The extraction
+regex, the site-counting regex and the comment-stripping that fed them are all gone.
+
+Two AST checks remain because `preProcessFile` alone is not enough:
+
+- It returns the literal **head** of a concatenated specifier (`import('@/a' + 'b')`
+  yields `'@/a'`), which would resolve to the wrong module while looking complete.
+  So a walk over the tree flags any `import()`/`require()` whose argument is not a
+  single string literal.
+- Some modules load code without naming it in an import. The old check matched the
+  spellings `new Worker(` and `createRequire(`, which `new wt.Worker(...)` and
+  `createRequire as cr` both defeat. The test is now on the **import** —
+  `node:worker_threads`, `node:module`, `node:vm`, `node:child_process` — which no
+  alias can hide.
+
+### G98 — "It doesn't run at render" was an assertion, not a checked property
+
+`closureOf` deleted any module whose first statement was `'use server'`, *before* any
+accounting ran — no site, no specifier, no `unanalyzable` entry. The docstring's
+premise, "nothing in it runs while the importing page renders, it is reached only by
+a POST", is false twice over: module-level statements execute at import, and an
+exported action is an ordinary async function a server component may call inline.
+
+Two proofs, both anonymous `GET /login` returning every tenant at **exit 0**:
+
+- A new `lib/boot.ts` beginning `'use server'` with **zero exports** — so it satisfied
+  every per-export action check vacuously — doing its work in a module-level statement.
+  285/285.
+- No new module at all: the leak inside `app/login/actions.ts`, which the page already
+  imports and the resolver already dropped, awaited by the page. 281/281, and
+  `DATALESS_PAGE_CLOSURES` unchanged because the module set never moved.
+
+Action modules are now followed like any other, so they appear in the enumerated
+closure and a new one fails the set comparison. For the second variant the set does
+not move, so the rule is stated directly: **a dataless page may pass a server action
+to a form, never invoke it.** Invoking it runs that module's queries at render.
+
+### G99 — Three conventions that render on the server were checked by intent
+
+- `app/layout.tsx` wraps every page including the anonymous `/login`, and was checked
+  by grepping **its own file** for `.from(`/`.rpc(` — the same supabase-js model G93
+  had already rejected for pages, and blind to a helper one import away. A layout
+  reading every tenant through such a helper passed at 174/174 and served the rows.
+- `loading.tsx` and `error.tsx` were skipped by filename under the comment "purely
+  presentational conventions render no data of their own". That is an assertion about
+  intent. `loading.tsx` is a server component whose output streams to the browser;
+  one reading every tenant passed the whole suite, rows visible in the flight payload.
+- The metadata routes had the identical own-file weakness, and those responses are
+  exactly what a CDN caches.
+
+All of them now ask the question of the **closure** rather than the file, and the
+fallbacks are collected rather than exempted.
+
+### G100 — The flight payload was not the only way out of an action
+
+G94 closed the return channel and the comment said the channel was closed. There were
+two more, and both are the house idiom rather than exotic: every action already
+reports outcomes by redirecting with a query parameter, so
+`redirect(LOGIN_PATH + '?k=' + process.env.SUPABASE_SERVICE_ROLE_KEY)` satisfied the
+`Promise<void>` signature, the return ban, and all 9 secret checks — while a 303
+`Location` header carried the service-role key to an anonymous caller. Cookies are the
+same shape. The scan cannot see either, because it never POSTs an action.
+
+Redirect targets and cookie values may no longer be built out of `process.env`.
+
 ## Known, accepted limitations
 
 Stated plainly rather than left to be discovered.

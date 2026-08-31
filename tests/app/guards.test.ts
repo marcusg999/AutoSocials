@@ -10,7 +10,7 @@
 import { describe, expect, test } from 'vitest'
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 
-import { closureSource, moduleClosure } from '../../scripts/module-closure'
+import { closureSource, moduleClosure, moduleKind, resolveLocal } from '../../scripts/module-closure'
 import { join, relative } from 'node:path'
 
 function walk(dir: string, out: string[] = []): string[] {
@@ -65,8 +65,14 @@ const actionFiles = appFiles.filter(
 const pageFiles = appFiles.filter((f) => /\/(page|default)\.(m|c)?[jt]sx?$/.test(f))
 const layoutFiles = appFiles.filter((f) => /\/(layout|template)\.(m|c)?[jt]sx?$/.test(f))
 const metadataRoutes = appFiles.filter(
-  (f) => /\/(opengraph-image|twitter-image|icon|apple-icon|sitemap|robots|not-found)\.(m|c)?[jt]sx?$/.test(f),
+  (f) => /\/(opengraph-image|twitter-image|icon|apple-icon|sitemap|robots|not-found|manifest)\.(m|c)?[jt]sx?$/.test(f),
 )
+// loading.tsx and error.tsx were exempted by filename as "purely presentational".
+// That is an assertion about intent, not a checked property: loading.tsx is a server
+// component whose output streams to the anonymous browser, and one reading every
+// tenant passed the whole suite at 174/174.
+const fallbackFiles = appFiles.filter(
+  (f) => /\/(loading|error|global-error)\.(m|c)?[jt]sx?$/.test(f))
 const routeHandlers = appFiles.filter((f) => /\/route\.(m|c)?[jt]sx?$/.test(f))
 
 /** Source with comments removed, so a commented-out guard cannot satisfy a match. */
@@ -195,13 +201,10 @@ describe('the enumeration this file performs is the complete one', () => {
     const ROUTE_CONVENTIONS =
       /\/(page|layout|template|default|route|loading|error|global-error|not-found|opengraph-image|twitter-image|icon|apple-icon|sitemap|robots|manifest)\.(m|c)?[jt]sx?$/
     const routable = appFiles.filter((f) => f.startsWith('app/') && ROUTE_CONVENTIONS.test(f))
-    const collected = new Set([...pageFiles, ...layoutFiles, ...metadataRoutes, ...routeHandlers])
-
-    // Purely presentational conventions render no data of their own.
-    const NO_DATA_CONVENTIONS = /\/(loading|error|global-error)\.(m|c)?[jt]sx?$/
+    const collected = new Set([...pageFiles, ...layoutFiles, ...metadataRoutes, ...routeHandlers,
+      ...fallbackFiles])
 
     for (const file of routable) {
-      if (NO_DATA_CONVENTIONS.test(file)) continue
       expect([...collected], `${relative(process.cwd(), file)} is a real route but no collector in `
         + 'this file picks it up, so nothing checks its guards').toContain(file)
     }
@@ -360,6 +363,25 @@ describe('every server action', () => {
       + 'payload, which the secret scan cannot read').toEqual([])
   })
 
+  // The return ban closes the flight payload. It is not the only way out.
+  //
+  // Every action here already reports outcomes by redirecting with a query parameter
+  // (`?error=invalid`), so `redirect(LOGIN_PATH + '?k=' + process.env.SERVICE_ROLE_KEY)`
+  // is the house idiom, not an exotic construct -- and it satisfied the Promise<void>
+  // signature, the return ban, and all 9 secret checks, while a 303 Location header
+  // carried the service-role key to an anonymous caller. Cookies are the same shape.
+  // The scan cannot see either, because it never POSTs an action.
+  test.each(everyAction)('%s → %s() puts no server value in a redirect or a cookie', (file, name) => {
+    const body = bodyOf(join(process.cwd(), file), name)
+    const outbound = [...body.matchAll(/(?:redirect|permanentRedirect)\s*\(([\s\S]*?)\)\s*$/gm),
+                      ...body.matchAll(/cookies\(\)[\s\S]{0,40}?\.set\s*\(([\s\S]*?)\)/g)]
+    for (const match of outbound) {
+      expect(match[1]!, `${name} builds a redirect target or cookie value out of `
+        + 'process.env. That reaches the browser in a Location header or Set-Cookie, '
+        + 'which nothing in the secret scan reads').not.toMatch(/process\.env/)
+    }
+  })
+
   test.each(everyAction)('%s → %s() writes an audit_log row', (file, name) => {
     const body = bodyOf(join(process.cwd(), file), name)
     expect(body, `${name} mutates without recording an audit_log row`)
@@ -381,16 +403,39 @@ describe('every page', () => {
   // CSRF token to the signed-in subject; none of them queries a table.
   const DATALESS_PAGE_CLOSURES: Record<string, string[]> = {
     'app/login/page.tsx': [
+      'app/login/actions.ts',
       'app/login/page.tsx',
+      'lib/audit.ts',
       'lib/env.ts',
       'lib/security/csrf-token.ts',
       'lib/security/csrf.ts',
       'lib/security/routes.ts',
       'lib/security/scan-mode.ts',
       'lib/security/session.ts',
+      'lib/supabase/admin.ts',
       'lib/supabase/server.ts',
     ],
     'app/page.tsx': ['app/page.tsx', 'lib/security/routes.ts'],
+  }
+
+  // A dataless page may IMPORT a server action -- its form needs one -- but must not
+  // CALL it. The action modules genuinely do query (signInAction audits and signs
+  // in), so their presence in the closure above cannot be read as "this page queries";
+  // what makes the page dataless is that it only hands these to a form's action prop.
+  // Without this, a leak added inside an already-listed action module and awaited by
+  // the page changed no module in the set and rendered every tenant anonymously.
+  const actionBindingsOf = (file: string): string[] => {
+    const source = code(join(process.cwd(), file))
+    const names: string[] = []
+    for (const m of source.matchAll(/import\s*\{([^}]*)\}\s*from\s*['"]([^'"]+)['"]/g)) {
+      const resolved = resolveLocal(m[2]!, join(process.cwd(), file))
+      if (!resolved || moduleKind(readFileSync(resolved, 'utf8')) !== 'server-action') continue
+      for (const part of m[1]!.split(',')) {
+        const name = part.trim().split(/\s+as\s+/).pop()?.trim()
+        if (name) names.push(name)
+      }
+    }
+    return names
   }
 
   test('there is at least one page to check', () => {
@@ -432,6 +477,13 @@ describe('every page', () => {
         + 'rendering no data, and that claim covers everything it imports — read the new '
         + 'module and update DATALESS_PAGE_CLOSURES if it genuinely reads nothing')
         .toEqual(DATALESS_PAGE_CLOSURES[file])
+
+      for (const name of actionBindingsOf(file)) {
+        expect(source, `${file} calls the server action ${name} while rendering. A dataless `
+          + 'page may pass an action to a form, never invoke it — invoking it runs that '
+          + "module's queries at render time")
+          .not.toMatch(new RegExp(`(?:await\\s+|=\\s*)${name}\\s*\\(`))
+      }
       return
     }
 
@@ -487,24 +539,20 @@ describe('every route handler', () => {
   })
 })
 
-test('no metadata route renders tenant data without establishing a session', () => {
-  // opengraph-image.tsx and friends are real routes, and the image ones are exactly
-  // the sort of response a CDN will cache.
-  for (const file of metadataRoutes) {
-    const source = code(file)
-    if (/\.from\(|\.rpc\(/.test(source)) {
-      expect(source, `${relative(process.cwd(), file)} queries the database without a session guard`)
-        .toMatch(/requireMfaSession\(/)
-    }
-  }
-})
-
-test('no layout or template renders tenant data without establishing a session', () => {
-  // A layout wraps every page beneath it and can query just as freely.
-  for (const file of layoutFiles) {
-    const source = code(file)
-    if (/\.from\(|\.rpc\(/.test(source)) {
-      expect(source, `${relative(process.cwd(), file)} queries the database without a session guard`)
+test('nothing that renders around a page reads data without establishing a session', () => {
+  // Layouts, templates, metadata routes and Suspense/error fallbacks all render on
+  // the server, and a layout wraps every page beneath it -- including the anonymous
+  // /login. Each was checked by grepping its OWN file for `.from(`/`.rpc(`: the same
+  // supabase-js model already rejected for pages, and blind to a helper one import
+  // away. app/layout.tsx reading every tenant through such a helper passed at
+  // 174/174 and served the rows to an anonymous visitor.
+  //
+  // So the question is asked of the closure -- everything the file actually runs.
+  for (const file of [...layoutFiles, ...metadataRoutes, ...fallbackFiles]) {
+    const reachable = closureSource(file)
+    if (/\.from\(|\.rpc\(|createSupabaseAdminClient|\bfetch\(|from ['"]pg['"]/.test(reachable)) {
+      expect(code(file), `${relative(process.cwd(), file)} reads data (directly or through `
+        + 'something it imports) without establishing a session')
         .toMatch(/requireMfaSession\(/)
     }
   }
