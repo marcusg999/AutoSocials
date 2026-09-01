@@ -96,7 +96,12 @@ function hasComputedSpecifier(source: string, fileName: string): boolean {
         || (ts.isIdentifier(callee) && callee.text === 'require')
       if (isLoader) {
         const arg = node.arguments[0]
-        if (!arg || !ts.isStringLiteral(arg)) computed = true
+        // isStringLiteralLike, not isStringLiteral: `import(`./x`)` is a
+        // NoSubstitutionTemplateLiteral with exactly one static answer, and
+        // preProcessFile resolves it correctly. Rejecting it told the engineer to
+        // "use a literal import" in a file that already had one -- a false positive
+        // on honest code, which is what gets a check weakened rather than fixed.
+        if (!arg || !ts.isStringLiteralLike(arg)) computed = true
       }
     }
     ts.forEachChild(node, visit)
@@ -147,28 +152,7 @@ function assertComplete(entry: string, unanalyzable: string[]): void {
   )
 }
 
-/**
- * A module specifier this resolver cannot follow, because it is not a literal:
- * `import(someVariable)`, `require(`@/${name}`)`. There is no static answer to
- * "what does this page run", so any claim resting on the closure is unprovable and
- * must fail rather than pass quietly.
- */
-function stripComments(source: string): string {
-  return source
-    .replace(/\/\*[\s\S]*?\*\//g, ' ')
-    .replace(/(^|[^:])\/\/.*$/gm, '$1')
-}
 
-function hasUnanalyzableSpecifier(code: string): boolean {
-  // The WHOLE argument must be one quoted string. Testing only the first character
-  // let `import('@/lib/repo' + 'rting')` read as a literal: the specifier regex
-  // extracted '@/lib/repo', resolved nothing, and the page was certified dataless
-  // while it rendered every tenant.
-  for (const match of code.matchAll(/(?:^|[^.\w])(?:import|require)\s*\(([^)]*)\)/gm)) {
-    if (!/^\s*(['"])[^'"]*\1\s*$/.test(match[1]!)) return true
-  }
-  return false
-}
 
 /** The closure, plus any file in it whose imports could not be followed. */
 export function closureOf(entry: string, root = process.cwd()):

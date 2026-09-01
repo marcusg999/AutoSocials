@@ -159,10 +159,27 @@ describe('C3 — a signed-out visitor holds no privilege on anything', () => {
     })
   })
 
-  test('even a signed-in user cannot TRUNCATE, so the audit log cannot be wiped', async () => {
+  test('no role can TRUNCATE audit_log, so the audit log cannot be wiped', async () => {
+    // The name of this test used to promise "the audit log cannot be wiped" while
+    // trying it only as a signed-in user. service_role -- the role this app's own
+    // server runs as -- kept Supabase's default grant, so our own code could destroy
+    // the trail our own code writes, in one statement, firing no trigger and
+    // unfiltered by RLS. Every role that exists is checked now.
     await asUser(url, OWNER, 'aal2', async (q) => {
       const err = await expectRejected(() => q(`truncate public.audit_log cascade`))
       expect(err.message).toMatch(/permission denied|must be owner/i)
+    })
+    await asAdmin(url, async (q) => {
+      const r = await q(`
+        select rolname,
+               has_table_privilege(rolname, 'public.audit_log', 'TRUNCATE') as may_truncate
+        from pg_roles where rolname in ('anon', 'authenticated', 'service_role')
+        order by rolname`)
+      for (const row of r.rows) {
+        expect(row.may_truncate, `${row.rolname} can TRUNCATE audit_log, so the append-only `
+          + 'triggers can be stepped around entirely').toBe(false)
+      }
+      expect(r.rows.length, 'not every role was checked').toBe(3)
     })
   })
 })

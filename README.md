@@ -33,8 +33,14 @@ why it matters. Three are easy to get wrong:
 - `TRUSTED_PROXY_COUNT` — how many proxies sit in front of the app. Set it wrong and the
   audit log records a client address the client chose. Default `1`.
 
-Never prefix a server-only variable with `NEXT_PUBLIC_`. `npm run test:secrets` fails the
-build if you do.
+Never prefix a server-only variable with `NEXT_PUBLIC_` — the prefix inlines the value into
+the browser bundle. `npm run test:secrets` enumerates the two variables that are meant to be
+public and fails on any other `NEXT_PUBLIC_` name, whatever it is called; an earlier version
+only matched secret-*sounding* names, and renaming `DATABASE_URL` to
+`NEXT_PUBLIC_DATABASE_URL` passed it while serving a real connection string to the browser.
+
+The `db:*` and `seed:admin` scripts read `.env.local` themselves (via Node's
+`--env-file-if-exists`); `next dev|build|start` read it natively.
 
 **2. Create the schema.**
 
@@ -42,7 +48,7 @@ build if you do.
 npm run db:up
 ```
 
-This applies ten migrations in order and seeds seven businesses, `BUSINESS_1` through
+This applies eleven migrations in order and seeds seven businesses, `BUSINESS_1` through
 `BUSINESS_7`. It is idempotent — running it twice is safe. `npm run db:down` rolls back,
 and refuses to run while `audit_log` has rows unless you set
 `ALLOW_DESTRUCTIVE_ROLLBACK=yes`, because the audit trail is append-only by design.
@@ -50,12 +56,16 @@ and refuses to run while `audit_log` has rows unless you set
 **3. Create the first administrator.**
 
 ```bash
-ADMIN_EMAIL=you@example.com ADMIN_PASSWORD='a-long-strong-password' npx tsx scripts/seed-admin.ts
+npm run seed:admin
 ```
 
-This creates the user through Supabase Auth and makes them an owner of all seven
-businesses. It deliberately does **not** create an MFA factor — you enrol that yourself on
-first sign-in, so the TOTP secret is never handled by a script.
+This reads `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`
+from `.env.local` — set all four there rather than passing them on the command line, which
+would put the service-role key in your shell history.
+
+It creates the user through Supabase Auth and makes them an owner of all seven businesses.
+It deliberately does **not** create an MFA factor — you enrol that yourself on first
+sign-in, so the TOTP secret is never handled by a script.
 
 **4. Run it.**
 
@@ -101,6 +111,13 @@ npm run test:db       # tenancy, MFA, audit, vault, migrations, hardening
 npm run test:secrets  # builds with canary secrets and reads every route as a browser would
 ```
 
+`test:secrets` also renders every route **anonymously with a probe attached to the socket
+layer** and fails if the render opens a database connection or calls PostgREST. That check
+exists because five consecutive review rounds defeated the static equivalent: the question
+"does this page read tenant data" cannot be answered by inspecting which modules it names,
+since a read added inside a module the page already ran changed nothing any static model
+looked at.
+
 The database tests need a Postgres server on `ADMIN_DATABASE_URL` (default
 `postgres://postdeck:postdeck@127.0.0.1:5432/postgres`). They create and drop their own
 scratch databases, and connect as a real `authenticated` role via `SET LOCAL ROLE` so that
@@ -124,8 +141,11 @@ that misses a path also misses its actions.
 account id and derives the secret name — so the stored reference is never a lookup key.
 
 **Audit.** Append-only, enforced by triggers that refuse UPDATE and DELETE from every role
-including `service_role`. Row changes are recorded by database triggers rather than by
-application code, so a new mutation path cannot forget to audit itself.
+including `service_role`, and by revoking TRUNCATE from every role — TRUNCATE fires no row
+triggers and is not filtered by row level security, so without that revoke the whole trail
+was removable in one statement by the role this app's own server uses. Row changes are
+recorded by database triggers rather than by application code, so a new mutation path
+cannot forget to audit itself.
 
 ## Reading further
 

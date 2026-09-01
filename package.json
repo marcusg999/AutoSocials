@@ -11,14 +11,15 @@
     "start": "next start",
     "typecheck": "tsc --noEmit",
     "lint": "next lint",
-    "db:up": "tsx scripts/migrate.ts up",
-    "db:down": "tsx scripts/migrate.ts down",
-    "db:reset": "tsx scripts/migrate.ts reset",
+    "db:up": "tsx --env-file-if-exists=.env.local scripts/migrate.ts up",
+    "db:down": "tsx --env-file-if-exists=.env.local scripts/migrate.ts down",
+    "db:reset": "tsx --env-file-if-exists=.env.local scripts/migrate.ts reset",
     "test": "vitest run",
     "test:db": "vitest run tests/db",
     "test:secrets": "tsx scripts/check-no-secrets.ts",
     "gauntlet": "tsx scripts/gauntlet.ts",
-    "verify": "APP_ORIGIN=${APP_ORIGIN:-http://127.0.0.1:3000} npm run build && npm run typecheck && npm run test && npm run test:secrets"
+    "verify": "APP_ORIGIN=${APP_ORIGIN:-http://127.0.0.1:3000} npm run build && npm run typecheck && npm run test && npm run test:secrets",
+    "seed:admin": "tsx --env-file-if-exists=.env.local scripts/seed-admin.ts"
   },
   "dependencies": {
     "@supabase/ssr": "0.12.4",

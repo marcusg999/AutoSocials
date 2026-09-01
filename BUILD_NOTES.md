@@ -1418,6 +1418,94 @@ same shape. The scan cannot see either, because it never POSTs an action.
 
 Redirect targets and cookie values may no longer be built out of `process.env`.
 
+### G101 — Stop modelling. Watch.
+
+Five consecutive rounds found the defect inside the previous round's fix, always in
+the same place: the guard claiming a page reads no tenant data. The models tried, in
+order — which module-naming syntax appears in the file; the same via the TypeScript
+compiler; the set of module PATHS the page reaches — each closed the previous hole
+and opened the next. Round 13 named why, exactly:
+
+> The extractor converged; the property did not. The set of module paths is invariant
+> under editing any of those 11 files.
+
+`lib/security/csrf.ts` is module #6 of the eleven `/login` runs, and the page has
+always called `await csrfField()`. A `pg` client opened inside it read every business
+and served it to an anonymous browser with **285/285 and 9/9 passing**. Nothing static
+could see it: the module set did not change, `pg` is an external package, and the
+page file was byte-identical.
+
+So the check stopped being a model. `scripts/render-probe.cjs` is loaded into
+`next start`, and `check-no-secrets.ts` renders **every route anonymously** — no scan
+header, a genuinely unauthenticated browser — with the probe log cleared before each,
+and fails if that render performed a data read. There is no list to keep in step with
+the code and no page can be excused by a comment or a filename, because the property
+holds for every route: a guarded one redirects before it reads, an unguarded one has
+nothing tenant-scoped to show.
+
+**The seam matters, and I got it wrong first.** Version one hooked `Module._load` to
+catch `require('pg')`. It works in plain Node and is useless here: Next's bundler
+resolves `await import('pg')` inside a server component without going through Node's
+loader. I only found that because I distrusted a passing result and instrumented the
+leak itself — the injected code ran **29 times**, imported pg, constructed a Client
+and reached a real Postgres, while the probe recorded nothing and the scan reported
+success. That is precisely the false green this probe exists to end, produced by the
+probe. The seam is now `net.Socket.prototype.connect`: every driver, bundled or not,
+ends up opening a socket, and `net` is a core module the bundler cannot inline.
+
+Auth traffic is deliberately not a data read — `/login` legitimately asks the auth
+server who the caller is — so the line is PostgREST and live SQL connections, which is
+exactly where the property draws it.
+
+### G102 — Three checks that were still patterns, and a name the attacker chooses
+
+- **The redirect ban** captured the text between `redirect(` and `)` and looked for
+  `process.env`. One local `const` hoisted the read one line up and emptied the
+  capture; the service-role key shipped in a 303 `Location` header to an anonymous
+  caller with all 9 secret checks passing. `headers().set`, a thrown message and
+  `revalidatePath` are the same hole in different spellings. No action in this phase
+  needs an environment variable, so none may read one — the value is denied at its
+  source rather than at each of its exits.
+- **`FORBIDDEN_IN_PUBLIC`** matched secret-*sounding* names. Renaming `DATABASE_URL`
+  to `NEXT_PUBLIC_DATABASE_URL` passed it *and* removed the variable from the canary
+  population, which filters `NEXT_PUBLIC_` out. The count went from "8 checked" to
+  "7 checked" and nothing objected. The name is the attacker's to choose, so the
+  public variables are enumerated: exactly two values are meant to reach the browser.
+- **The layout/fallback closure check** was five regexes; `await import('pg')` matched
+  none of them (`from 'pg'` is a static-import spelling). The runtime probe covers
+  this now regardless of how the read is written.
+
+### G103 — The README told people to run commands that do not work
+
+Three defects in a document I had written a few hours earlier, found by pointing the
+reviewer at it:
+
+- Steps 2 and 3 said to fill `.env.local` and then run `npm run db:up` and
+  `npx tsx scripts/seed-admin.ts`. `tsx` does not read `.env.local` — only
+  `next dev|build|start` do — so both fail on a clean checkout with
+  `DATABASE_URL is not set`. The most natural workaround,
+  `export $(cat .env.local | xargs)`, puts the service-role key into shell history and
+  every child process. The scripts now load it themselves via Node's
+  `--env-file-if-exists`, so the documented steps are true.
+- It stated that `test:secrets` "fails the build if you do" prefix a server variable
+  with `NEXT_PUBLIC_`. It did not, until G102.
+- It said "ten migrations". There are eleven.
+
+A README that tells someone to do the wrong thing is a defect like any other, and this
+one had never been reviewed by anybody.
+
+### G104 — `service_role` could TRUNCATE the audit log
+
+`0006` revokes TRUNCATE from `anon` and `authenticated`, with a correct explanation of
+why it matters: RLS does not filter TRUNCATE, and TRUNCATE fires no row triggers, so
+the append-only triggers never see it. It missed that Supabase also grants ALL to
+`service_role` — the role this app's own server runs as. The trail our own code writes
+was destroyable in one statement by our own code.
+
+The test was named *"even a signed-in user cannot TRUNCATE, so the audit log cannot be
+wiped"* and only ever tried it as a signed-in user; the clause after the comma was
+false. It now checks every role that exists, and asserts it checked three.
+
 ## Known, accepted limitations
 
 Stated plainly rather than left to be discovered.

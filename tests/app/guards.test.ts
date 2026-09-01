@@ -371,15 +371,25 @@ describe('every server action', () => {
   // signature, the return ban, and all 9 secret checks, while a 303 Location header
   // carried the service-role key to an anonymous caller. Cookies are the same shape.
   // The scan cannot see either, because it never POSTs an action.
-  test.each(everyAction)('%s → %s() puts no server value in a redirect or a cookie', (file, name) => {
+  test.each(everyAction)('%s → %s() reads no environment variable at all', (file, name) => {
+    // The previous version captured the text between `redirect(` and `)` and checked
+    // it for process.env. One local const defeated it:
+    //
+    //     const diag = process.env.SUPABASE_SERVICE_ROLE_KEY ?? ''
+    //     redirect(`${LOGIN_PATH}?error=invalid&d=${diag}`)
+    //
+    // and the service-role key shipped in a 303 Location header to an anonymous
+    // caller with all 9 secret checks passing. Every outbound channel an action has
+    // -- the redirect target, a cookie, a header, a thrown message -- is a different
+    // spelling of the same hole, so the rule is on the SOURCE of the value instead:
+    // no action in this phase needs an environment variable, so none may read one.
+    // Anything that legitimately needs configuration should take it as an argument
+    // from a caller that is itself checked.
     const body = bodyOf(join(process.cwd(), file), name)
-    const outbound = [...body.matchAll(/(?:redirect|permanentRedirect)\s*\(([\s\S]*?)\)\s*$/gm),
-                      ...body.matchAll(/cookies\(\)[\s\S]{0,40}?\.set\s*\(([\s\S]*?)\)/g)]
-    for (const match of outbound) {
-      expect(match[1]!, `${name} builds a redirect target or cookie value out of `
-        + 'process.env. That reaches the browser in a Location header or Set-Cookie, '
-        + 'which nothing in the secret scan reads').not.toMatch(/process\.env/)
-    }
+    expect(body, `${name} reads process.env. An action has several ways to hand a value `
+      + 'to the browser — a redirect target, a cookie, a header — and the scan reads '
+      + 'none of them, so the value is denied at its source instead')
+      .not.toMatch(/process\.env/)
   })
 
   test.each(everyAction)('%s → %s() writes an audit_log row', (file, name) => {

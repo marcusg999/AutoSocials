@@ -12,7 +12,7 @@ import { execFileSync, spawn } from 'node:child_process'
 import { createServer } from 'node:http'
 import { SCAN_ACK_HEADER, SCAN_HEADER, SCAN_STATE_HEADER, scanAcknowledgement } from '../lib/security/scan-mode'
 import { closureSource } from './module-closure'
-import { existsSync, readFileSync, readdirSync, statSync, rmSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, statSync, rmSync, writeFileSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { join, relative } from 'node:path'
 
@@ -101,8 +101,35 @@ function checkPublicVarNames() {
       if (FORBIDDEN_IN_PUBLIC.test(name)) offenders.push(`${relative(ROOT, file)}: ${name}`)
     }
   }
-  if (offenders.length) fail(`secret-sounding NEXT_PUBLIC_ variables (these are inlined into the browser bundle):\n    ${offenders.join('\n    ')}`)
-  else pass('no NEXT_PUBLIC_ variable is named like a secret')
+  if (offenders.length) {
+    fail(`secret-sounding NEXT_PUBLIC_ variables (these are inlined into the browser bundle):\n    ${offenders.join('\n    ')}`)
+    return
+  }
+
+  // A NAME TEST IS NOT ENOUGH, because the name is the attacker's to choose.
+  //
+  // Renaming DATABASE_URL to NEXT_PUBLIC_DATABASE_URL in .env.example passed this
+  // check (the pattern above does not match "DATABASE_URL") AND removed the variable
+  // from the canary population, because that population filters NEXT_PUBLIC_ names
+  // out. The count silently went from 8 checked to 7, nothing objected, and a real
+  // connection string was served to an anonymous browser and inlined into a chunk.
+  //
+  // So the public variables are enumerated. Exactly two things in this app are meant
+  // to reach the browser; anything else wearing the prefix fails until a person
+  // decides it belongs, whatever it is called.
+  const PUBLIC_BY_DESIGN = ['NEXT_PUBLIC_SUPABASE_URL', 'NEXT_PUBLIC_SUPABASE_ANON_KEY']
+  const declared = [...new Set((readFileSync(join(ROOT, '.env.example'), 'utf8')
+    .match(/^NEXT_PUBLIC_[A-Z0-9_]+/gm) ?? []))].sort()
+  const unexpected = declared.filter((name) => !PUBLIC_BY_DESIGN.includes(name))
+  if (unexpected.length) {
+    fail(`.env.example declares NEXT_PUBLIC_ variables that are not on the list of `
+      + `values meant to reach the browser: ${unexpected.join(', ')}. The prefix makes `
+      + `a value public and removes it from the canary population, so a server value `
+      + `renamed into it becomes invisible to every other check here.`)
+    return
+  }
+  pass(`no NEXT_PUBLIC_ variable is named like a secret, and only the ${PUBLIC_BY_DESIGN.length} `
+    + 'values meant to be public carry the prefix')
 }
 
 // ---------------------------------------------------------------------------
@@ -471,8 +498,19 @@ async function checkServedResponses() {
 
   // Bound to loopback: this server runs with the scan bypass live and must not be
   // reachable from the network.
+  // The probe records data reads the render actually performs. See
+  // scripts/render-probe.cjs for why this exists rather than another static model.
+  const probeLog = join(ROOT, '.next', 'render-probe.log')
+  writeFileSync(probeLog, '')
   const server = spawn('npx', ['next', 'start', '-p', String(PORT), '-H', '127.0.0.1'], {
-    cwd: ROOT, env: buildEnvironment(), stdio: ['ignore', 'ignore', 'pipe'], detached: true,
+    cwd: ROOT,
+    env: {
+      ...buildEnvironment(),
+      RENDER_PROBE_LOG: probeLog,
+      RENDER_PROBE_ALLOWED_PORT: String(STUB_PORT),
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require ${join(ROOT, 'scripts/render-probe.cjs')}`.trim(),
+    },
+    stdio: ['ignore', 'ignore', 'pipe'], detached: true,
   })
   let serverStderr = ''
   server.stderr?.on('data', (chunk) => { serverStderr += String(chunk) })
@@ -604,8 +642,45 @@ async function checkServedResponses() {
       fail('not one RSC flight payload was read — the channel a server-to-client prop '
         + 'actually travels on went uninspected while the scan reported success')
     }
-    const neverRendered = [...table.keys()].filter((route) => !rendered.has(route))
+    // OBSERVATION, NOT MODELLING — and of every route, not a claimed subset.
+    //
+    // The property: an anonymous visitor's render performs NO tenant data read.
+    // That holds for every route in this app, not just the two that claim to be
+    // dataless: a guarded route redirects before it reads, and an unguarded one has
+    // nothing tenant-scoped to show. So there is no list to keep in step with the
+    // code, and no page can be excused from it by a comment or a filename.
+    //
+    // Each route is fetched with NO scan header -- a genuinely anonymous browser,
+    // not a privileged one -- with the probe log cleared first, so anything recorded
+    // in that window belongs to that render. A read added inside a module the page
+    // already runs, which no static model caught in five rounds of trying, is caught
+    // here because the render really does perform it.
+    let probed = 0
+    let probeLeaks = 0
+    for (const route of table.keys()) {
+      writeFileSync(probeLog, '')
+      try {
+        await fetch(`${ORIGIN}${route}`, { redirect: 'manual' })
+      } catch { /* a route that refuses an anonymous request is fine */ }
+      probed += 1
+      const reads = readFileSync(probeLog, 'utf8').trim()
+      if (reads) {
+        probeLeaks += 1
+        fail(`an ANONYMOUS render of ${route} performed a tenant data read. Nothing an `
+          + `unauthenticated visitor can reach may read tenant data:\n`
+          + reads.split('\n').map((line) => `      ${line}`).join('\n'))
+      }
+    }
+    // Only claim the clean result when it is the actual result. Printing the
+    // reassuring summary alongside a failure is the reporting bug this whole project
+    // keeps rediscovering.
+    if (probeLeaks === 0) {
+      console.log(`  PROBE ${probed} route(s) rendered anonymously with no tenant data read observed`)
+    }
+
     const dataless = datalessRoutes()
+
+    const neverRendered = [...table.keys()].filter((route) => !rendered.has(route))
     const unexplained = neverRendered.filter((route) => !dataless.has(route))
     if (unexplained.length) {
       fail(`these routes never rendered a document in any session state, so nothing was `
