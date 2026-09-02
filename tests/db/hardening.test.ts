@@ -170,16 +170,26 @@ describe('C3 — a signed-out visitor holds no privilege on anything', () => {
       expect(err.message).toMatch(/permission denied|must be owner/i)
     })
     await asAdmin(url, async (q) => {
+      // EVERY role, enumerated from the catalogue. Naming three literals and
+      // asserting the count is three guards against one of them vanishing, not
+      // against a fourth appearing -- and a real Supabase project already has
+      // authenticator, supabase_admin and dashboard_user. A role a later phase
+      // creates emptied this table in one statement, firing no row trigger and
+      // unfiltered by RLS, with the test named "the audit log cannot be wiped"
+      // passing. Only the cluster's own superusers are exempt, because nothing in
+      // the database can stop them.
       const r = await q(`
         select rolname,
                has_table_privilege(rolname, 'public.audit_log', 'TRUNCATE') as may_truncate
-        from pg_roles where rolname in ('anon', 'authenticated', 'service_role')
+        from pg_roles
+        where rolname not like 'pg\\_%' and not rolsuper
         order by rolname`)
       for (const row of r.rows) {
         expect(row.may_truncate, `${row.rolname} can TRUNCATE audit_log, so the append-only `
           + 'triggers can be stepped around entirely').toBe(false)
       }
-      expect(r.rows.length, 'not every role was checked').toBe(3)
+      expect(r.rows.length, 'no non-superuser roles were found at all, so this test proved '
+        + 'nothing').toBeGreaterThan(0)
     })
   })
 })

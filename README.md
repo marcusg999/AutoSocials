@@ -111,12 +111,17 @@ npm run test:db       # tenancy, MFA, audit, vault, migrations, hardening
 npm run test:secrets  # builds with canary secrets and reads every route as a browser would
 ```
 
-`test:secrets` also renders every route **anonymously with a probe attached to the socket
-layer** and fails if the render opens a database connection or calls PostgREST. That check
-exists because five consecutive review rounds defeated the static equivalent: the question
-"does this page read tenant data" cannot be answered by inspecting which modules it names,
-since a read added inside a module the page already ran changed nothing any static model
-looked at.
+`test:secrets` also attaches a probe to **both the build and the server** and fails if a
+tenant data read is observed — during the production build (a prerendered route's rows are
+baked into the output and served to everyone from cache) or during an anonymous request.
+The probe watches queries rather than connections: every write to a database socket, every
+`fetch` or `node:http` call on a PostgREST path. Watching connections alone was not enough,
+because a pooled connection is opened once and reused, so the read performs no connect.
+
+That check exists because six consecutive review rounds defeated the static equivalent: the
+question "does this page read tenant data" cannot be answered by inspecting which modules it
+names, since a read added inside a module the page already ran changed nothing any static
+model looked at.
 
 The database tests need a Postgres server on `ADMIN_DATABASE_URL` (default
 `postgres://postdeck:postdeck@127.0.0.1:5432/postgres`). They create and drop their own

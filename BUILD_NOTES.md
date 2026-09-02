@@ -1506,6 +1506,90 @@ The test was named *"even a signed-in user cannot TRUNCATE, so the audit log can
 wiped"* and only ever tried it as a signed-in user; the clause after the comma was
 false. It now checks every role that exists, and asserts it checked three.
 
+### G105 — A data read is not a socket handshake
+
+Round 14's verdict on the runtime probe: relocated a sixth time. Its statement of
+why is the clearest thing anyone has written about this loop:
+
+> A data read is not a handshake. It is a handshake PLUS every query afterwards on
+> that socket PLUS every byte baked into a cache by an earlier render.
+
+Three bypasses, each with the whole suite green:
+
+- **A pooled connection.** The connect happens once, at boot or during an earlier
+  phase of the scan whose records the probe loop then wipes. Every render afterwards
+  reuses the idle socket: no connect, no fetch, probe log **0 bytes**, two tenants'
+  private post bodies delivered to a browser with no cookie.
+- **A build-time read served from cache.** `app/sitemap.ts` is prerendered, and the
+  probe was only in `next start`'s NODE_OPTIONS, never in `next build`. At request
+  time Next serves the cached artifact, so the render the probe watches reads
+  nothing. The rows were baked into `.next/server/app/sitemap.xml.body` and served to
+  an authenticated user of a *different* tenant. A build-time read is strictly worse
+  than a request-time one: computed once, served to everyone, forever.
+- **`node:http` to `/rest/v1/`.** The fetch seam is on `globalThis.fetch`, which
+  `node:http` never touches; the socket seam exempts the Supabase port, which is
+  exactly where PostgREST lives. One request defeated both seams at once.
+
+The probe now watches **traffic, not connections**: sockets are tagged at connect and
+inspected at every WRITE, so a query on an already-open connection is a read; `fetch`,
+`node:http` and `node:https` are all read for a data-plane path
+(`/rest/v1/`, `/graphql/v1`, `/functions/v1/`) because the auth and data planes share
+a host and port and only the path separates them; and the probe rides `next build` as
+well as `next start`.
+
+### G106 — The probe crashed honest code and slandered the rest
+
+Two defects in the probe I had written hours earlier, and the round was right to
+insist they be fixed before anything else was trusted.
+
+Node normalises connect arguments, so `args[0]` can be an **array containing a
+null-prototype options object**. The hook did `String(args[0])` on that:
+
+- It **threw** `Cannot convert object to primitive value` from inside the hook,
+  before `realConnect` ran — so any dependency using the default HTTP agent (most
+  SDKs, tracing agents, `node-fetch`) turned every render into a 500. The scan was
+  measuring a different program than production.
+- On the non-throwing path it produced the port string `"[object Object],"`, which
+  never equals the allowed port — so honest auth traffic was reported as a tenant
+  data read. The scan was green only by accident: its probe loop sends no cookies, so
+  `getClaims()` short-circuits before touching the network. The first anonymous
+  render making any outbound call would have failed the scan.
+
+A probe that both breaks and slanders correct code is worse than no probe, because it
+is the one that gets deleted. Arguments are normalised properly now and nothing is
+coerced with `String()`.
+
+### G107 — Three more checks that named a population instead of enumerating one
+
+- **`bodyOf()` is the wrong window for reachability.** G94 correctly narrowed it so an
+  action could not absorb trailing helpers; that made a helper declared BELOW an
+  action sit outside the scanned text while remaining perfectly callable from inside
+  it. `redirect(...?d=${diagnostic()})` with `function diagnostic() { return
+  process.env.SUPABASE_SERVICE_ROLE_KEY }` passed at 100/100. Reachability is a
+  property of the module, so the module is what is checked now.
+- **The TRUNCATE check named three roles** and asserted the count was three — which
+  guards against one vanishing, not against a fourth appearing, while its comment
+  claimed "every role that exists is checked now". A role a later phase might create
+  emptied the append-only trail in one statement with the test passing. It enumerates
+  `pg_roles` now, exempting only superusers, because nothing in the database can stop
+  those.
+- **The `NEXT_PUBLIC_` enumeration read `.env.example`**, not the names the code uses.
+  A variable read by application code and set in the deployment environment escaped
+  both this check and the canary population, while this very check printed "only the
+  2 values meant to be public carry the prefix". It reads the source tree now —
+  comment-stripped, because otherwise this file's own prose about the previous
+  finding reads as a usage.
+
+### G108 — Two claims that were bigger than what was measured
+
+The README said `test:secrets` "fails if the render opens a database connection or
+calls PostgREST" — false in both halves, per G105. And the probe's summary line said
+`10 route(s) rendered anonymously`, counting fetches: seven of the ten are guarded, so
+the proxy redirects and the page never executes. It reads *requested* now, and says
+that guarded routes redirect before rendering and that the build is probed separately.
+Both are small; both are the same failure this project keeps finding, which is a
+report describing something other than what happened.
+
 ## Known, accepted limitations
 
 Stated plainly rather than left to be discovered.

@@ -19,3 +19,4 @@ next-env.d.ts
 /scratch/
 *.local.ts
 *.local.sh
+.probe/

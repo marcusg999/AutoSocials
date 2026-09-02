@@ -385,10 +385,22 @@ describe('every server action', () => {
     // no action in this phase needs an environment variable, so none may read one.
     // Anything that legitimately needs configuration should take it as an argument
     // from a caller that is itself checked.
-    const body = bodyOf(join(process.cwd(), file), name)
-    expect(body, `${name} reads process.env. An action has several ways to hand a value `
-      + 'to the browser — a redirect target, a cookie, a header — and the scan reads '
-      + 'none of them, so the value is denied at its source instead')
+    // The WHOLE MODULE, not bodyOf(). bodyOf stops at the next declaration -- which
+    // is correct for "did this action check CSRF" and wrong for "can this action
+    // reach a secret", because a helper declared BELOW the action sits outside the
+    // window while remaining perfectly callable from inside it:
+    //
+    //     if (!email) redirect(`${LOGIN_PATH}?d=${diagnostic()}`)
+    //     function diagnostic() { return process.env.SUPABASE_SERVICE_ROLE_KEY ?? '' }
+    //
+    // That passed at 100/100 while signInAction put the service-role key in a
+    // redirect target. Reachability is a property of the module, so the module is
+    // what gets checked.
+    const moduleSource = code(join(process.cwd(), file))
+    expect(moduleSource, `${file} reads process.env. An action has several ways to hand a `
+      + 'value to the browser — a redirect target, a cookie, a header — and the scan reads '
+      + 'none of them, so the value is denied at its source: nothing in an action module '
+      + 'may reach an environment variable, including a helper it calls')
       .not.toMatch(/process\.env/)
   })
 

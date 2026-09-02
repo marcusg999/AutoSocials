@@ -1,66 +1,110 @@
 /**
- * RUNTIME DATA-ACCESS PROBE.
+ * RUNTIME DATA-READ PROBE.
  *
- * Loaded into `next start` with --require by scripts/check-no-secrets.ts.
+ * Loaded into `next build` and `next start` with --require by
+ * scripts/check-no-secrets.ts.
  *
- * Thirteen review rounds established that no static model answers the question a
- * dataless page's guard is asking. The property is "rendering this page reads no
- * tenant data"; every static model has been a proxy for it -- which module-naming
- * syntax appears, which module paths are reached -- and each proxy was narrower than
- * the property. The last one failed because the set of module PATHS is invariant
- * under editing any module already on the list: a read added inside
- * lib/security/csrf.ts, which /login has always run, changed nothing the guard
- * looked at and served every tenant to an anonymous browser.
+ * Fourteen review rounds established that no static model answers the question the
+ * dataless-page guard asks. The property is "rendering this page reads no tenant
+ * data"; every model has been a proxy narrower than the property. The first runtime
+ * version was narrower too, and its proxy was:
  *
- * So this stops modelling and watches. It records the data reads a render actually
- * performs, at the two places a read can leave this process:
+ *     "a socket handshake started during this request, to a port I don't recognise"
  *
- *   - global fetch, which is how supabase-js talks to PostgREST, and how a raw
- *     `fetch()` to /rest/v1 would too;
- *   - the `pg` driver, for a direct connection that never touches fetch.
- *
- * Auth traffic is NOT a data read: /login legitimately asks the auth server who the
- * caller is before rendering. Only /rest/v1 (PostgREST) and a live SQL connection
- * count, which is exactly the line the property draws.
+ * A data read is not a handshake. It is a handshake PLUS every query afterwards on
+ * that socket PLUS every byte baked into a cache by an earlier render. So a POOLED
+ * connection -- opened once at boot, reused forever -- performed a live cross-tenant
+ * read for an anonymous browser with the probe log empty and the scan reporting
+ * success. This version watches the traffic, not the connection.
  */
 const { appendFileSync } = require('node:fs')
 
 const LOG = process.env.RENDER_PROBE_LOG
 if (LOG) {
+  const ALLOWED_PORT = String(process.env.RENDER_PROBE_ALLOWED_PORT ?? '')
   const record = (kind, detail) => {
     try { appendFileSync(LOG, JSON.stringify({ kind, detail }) + '\n') } catch { /* best effort */ }
   }
 
-  const realFetch = globalThis.fetch
-  globalThis.fetch = function (input, init) {
-    const url = typeof input === 'string' ? input : (input && input.url) || String(input)
-    // PostgREST is the data plane. /auth/v1 is the auth plane and is expected.
-    if (/\/rest\/v1\//.test(url)) record('postgrest', url)
-    return realFetch.call(this, input, init)
+  // The data plane, wherever it is spoken. /auth/v1 is the auth plane and is
+  // expected: /login legitimately asks the auth server who the caller is.
+  const DATA_PATH = /\/rest\/v1\/|\/graphql\/v1|\/functions\/v1\//
+  const describe = (value) => {
+    try { return typeof value === 'string' ? value : String(value?.href ?? value?.url ?? '') }
+    catch { return '' }
   }
 
-  // The SOCKET, not the module loader.
+  // ---- 1. fetch, which is how supabase-js speaks to PostgREST ----------------
+  const realFetch = globalThis.fetch
+  if (typeof realFetch === 'function') {
+    globalThis.fetch = function (input, init) {
+      const url = describe(input)
+      if (DATA_PATH.test(url)) record('postgrest', url)
+      return realFetch.call(this, input, init)
+    }
+  }
+
+  // ---- 2. node:http / node:https, which never touch global fetch -------------
   //
-  // The first version of this hooked Module._load to catch `require('pg')`. It works
-  // in plain Node and is useless here: Next's bundler resolves `await import('pg')`
-  // inside a server component without going through Node's loader at all. Verified
-  // the hard way -- the injected leak ran 29 times, imported pg, constructed a
-  // Client and reached a real Postgres, while the probe recorded nothing and the
-  // scan reported success. That is the same false green this probe exists to end.
+  // The data plane and the auth plane share a host and a port, so a port-based
+  // exemption cannot tell them apart: a `node:http` GET of /rest/v1/posts on the
+  // allowed port was invisible to BOTH seams at once. The path is what separates
+  // them, so the path is what is read.
+  for (const moduleName of ['node:http', 'node:https']) {
+    const mod = require(moduleName)
+    for (const method of ['request', 'get']) {
+      const real = mod[method]
+      mod[method] = function (...args) {
+        try {
+          for (const arg of args) {
+            if (typeof arg === 'string' && DATA_PATH.test(arg)) record('http', arg)
+            else if (arg && typeof arg === 'object' && typeof arg.path === 'string'
+                     && DATA_PATH.test(arg.path)) record('http', arg.path)
+          }
+        } catch { /* never let the probe change behaviour */ }
+        return real.apply(this, args)
+      }
+    }
+  }
+
+  // ---- 3. every byte written to a database socket ---------------------------
   //
-  // Every database driver, bundled or not, ends up opening a TCP socket. net is a
-  // core module the bundler cannot inline, so this is the one seam nothing gets past.
+  // Sockets are tagged at connect and inspected at WRITE, because a query on an
+  // already-open connection performs no connect. That is the whole of finding F1.
   const net = require('node:net')
+
+  /**
+   * Node normalises connect arguments before calling Socket.prototype.connect, so
+   * args[0] can be an ARRAY holding a null-prototype options object. The previous
+   * version did String(args[0]) on that and threw `Cannot convert object to
+   * primitive value` from inside the hook -- crashing every honest node:http render
+   * with a 500 -- and, on the non-throwing path, produced the port "[object Object],"
+   * which never equals the allowed port, so honest auth traffic was reported as a
+   * tenant data read. A probe that both breaks and slanders correct code is worse
+   * than no probe: it gets deleted.
+   */
+  const destinationOf = (args) => {
+    const first = Array.isArray(args[0]) ? args[0][0] : args[0]
+    if (first && typeof first === 'object') {
+      return { port: String(first.port ?? first.path ?? ''), host: String(first.host ?? 'localhost') }
+    }
+    return { port: String(first ?? ''), host: String(args[1] ?? 'localhost') }
+  }
+
   const realConnect = net.Socket.prototype.connect
   net.Socket.prototype.connect = function (...args) {
-    const options = typeof args[0] === 'object' && args[0] !== null ? args[0] : {}
-    const port = String(options.port ?? args[0] ?? '')
-    const host = String(options.host ?? args[1] ?? 'localhost')
-    // The Supabase stub is the auth plane and is expected during a render. Anything
-    // else an anonymous render opens is a direct data connection.
-    if (port && port !== String(process.env.RENDER_PROBE_ALLOWED_PORT ?? '')) {
-      record('socket', `${host}:${port}`)
-    }
+    try {
+      const { port, host } = destinationOf(args)
+      // A connection to anything that is not the Supabase host is a direct database
+      // connection. Tag it; every write on it is then a read.
+      this.__probeDataSocket = port !== '' && port !== ALLOWED_PORT ? `${host}:${port}` : null
+    } catch { this.__probeDataSocket = null }
     return realConnect.apply(this, args)
+  }
+
+  const realWrite = net.Socket.prototype.write
+  net.Socket.prototype.write = function (...args) {
+    if (this.__probeDataSocket) record('query', this.__probeDataSocket)
+    return realWrite.apply(this, args)
   }
 }

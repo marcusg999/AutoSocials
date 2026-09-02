@@ -12,7 +12,7 @@ import { execFileSync, spawn } from 'node:child_process'
 import { createServer } from 'node:http'
 import { SCAN_ACK_HEADER, SCAN_HEADER, SCAN_STATE_HEADER, scanAcknowledgement } from '../lib/security/scan-mode'
 import { closureSource } from './module-closure'
-import { existsSync, readFileSync, readdirSync, statSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, rmSync, writeFileSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { join, relative } from 'node:path'
 
@@ -118,18 +118,34 @@ function checkPublicVarNames() {
   // to reach the browser; anything else wearing the prefix fails until a person
   // decides it belongs, whatever it is called.
   const PUBLIC_BY_DESIGN = ['NEXT_PUBLIC_SUPABASE_URL', 'NEXT_PUBLIC_SUPABASE_ANON_KEY']
-  const declared = [...new Set((readFileSync(join(ROOT, '.env.example'), 'utf8')
-    .match(/^NEXT_PUBLIC_[A-Z0-9_]+/gm) ?? []))].sort()
+
+  // The population is every NEXT_PUBLIC_ name the CODE uses, not the ones
+  // .env.example happens to declare. Reading only .env.example meant a variable read
+  // by application code and set in the deployment environment -- never written down
+  // here -- escaped this check and the canary population both, while this very line
+  // printed "only the 2 values meant to be public carry the prefix".
+  const declared = [...new Set([
+    ...(existsSync(join(ROOT, '.env.example'))
+      ? readFileSync(join(ROOT, '.env.example'), 'utf8').match(/^NEXT_PUBLIC_[A-Z0-9_]+/gm) ?? []
+      : []),
+    // Comment-stripped, or this file's own prose about NEXT_PUBLIC_DATABASE_URL --
+    // written to explain a previous finding -- reads as a usage and fails the check.
+    ...sources.flatMap((file) => readFileSync(file, 'utf8')
+      .replace(/\/\*[\s\S]*?\*\//g, ' ')
+      .replace(/(^|[^:])\/\/.*$/gm, '$1')
+      .match(/NEXT_PUBLIC_[A-Z0-9_]+/g) ?? []),
+  ])].sort()
   const unexpected = declared.filter((name) => !PUBLIC_BY_DESIGN.includes(name))
   if (unexpected.length) {
-    fail(`.env.example declares NEXT_PUBLIC_ variables that are not on the list of `
+    fail(`these NEXT_PUBLIC_ variables are used or declared but are not on the list of `
       + `values meant to reach the browser: ${unexpected.join(', ')}. The prefix makes `
       + `a value public and removes it from the canary population, so a server value `
       + `renamed into it becomes invisible to every other check here.`)
     return
   }
-  pass(`no NEXT_PUBLIC_ variable is named like a secret, and only the ${PUBLIC_BY_DESIGN.length} `
-    + 'values meant to be public carry the prefix')
+  pass(`no NEXT_PUBLIC_ variable is named like a secret, and of the ${declared.length} such `
+    + `name(s) used anywhere in this project, all are on the ${PUBLIC_BY_DESIGN.length}-value `
+    + 'allowlist meant to reach the browser')
 }
 
 // ---------------------------------------------------------------------------
@@ -247,6 +263,10 @@ const ORIGIN = `http://127.0.0.1:${PORT}`
 // never written anywhere. See lib/security/scan-mode.ts for the fences.
 const SCAN_TOKEN = randomBytes(32).toString('hex')
 const STUB_PORT = 3988
+
+/** Probe logs live outside .next, which this script deletes before each build. */
+const PROBE_DIR = join(ROOT, '.probe')
+mkdirSync(PROBE_DIR, { recursive: true })
 
 function buildEnvironment(): NodeJS.ProcessEnv {
   return {
@@ -478,10 +498,30 @@ async function waitForOurServer(): Promise<string | null> {
 }
 
 async function checkServedResponses() {
+  const buildProbeLog = join(PROBE_DIR, 'build-probe.log')
   console.log('  building with canary secrets in the server environment...')
   rmSync(join(ROOT, '.next'), { recursive: true, force: true })
   try {
-    execFileSync('npx', ['next', 'build'], { cwd: ROOT, env: buildEnvironment(), stdio: 'pipe', encoding: 'utf8' })
+    // The probe rides the BUILD as well as the server.
+    //
+    // A route Next prerenders is rendered once, at build time, and every later
+    // request is served the cached artifact -- so the render the probe watches at
+    // request time performs no read at all. app/sitemap.ts reading every tenant was
+    // baked into .next/server/app/sitemap.xml.body and served to an authenticated
+    // user of another tenant, with 287/287 and 9/9 passing. A build-time read is
+    // strictly worse than a request-time one: it is computed once and served to
+    // everyone, forever.
+    writeFileSync(buildProbeLog, '')
+    execFileSync('npx', ['next', 'build'], {
+      cwd: ROOT,
+      env: {
+        ...buildEnvironment(),
+        RENDER_PROBE_LOG: buildProbeLog,
+        RENDER_PROBE_ALLOWED_PORT: String(STUB_PORT),
+        NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require ${join(ROOT, 'scripts/render-probe.cjs')}`.trim(),
+      },
+      stdio: 'pipe', encoding: 'utf8',
+    })
   } catch (err: any) {
     fail(`next build failed, so nothing could be scanned:\n${err.stdout ?? ''}${err.stderr ?? ''}`)
     return
@@ -493,6 +533,16 @@ async function checkServedResponses() {
     return
   }
 
+  const buildReads = existsSync(buildProbeLog) ? readFileSync(buildProbeLog, 'utf8').trim() : ''
+  if (buildReads) {
+    fail('the production BUILD performed a tenant data read. Whatever route did this is '
+      + 'prerendered, so the rows are baked into the build output and served to every '
+      + `visitor from cache:\n${buildReads.split('\n').map((l) => `      ${l}`).join('\n')}`)
+  } else {
+    pass('the production build performed no tenant data read, so no rows are baked into a '
+      + 'prerendered route')
+  }
+
   console.log(`  serving the app and reading ${routes.length} route(s) as a browser would...`)
   const stub = startSupabaseStub(STUB_PORT)
 
@@ -500,7 +550,7 @@ async function checkServedResponses() {
   // reachable from the network.
   // The probe records data reads the render actually performs. See
   // scripts/render-probe.cjs for why this exists rather than another static model.
-  const probeLog = join(ROOT, '.next', 'render-probe.log')
+  const probeLog = join(PROBE_DIR, 'render-probe.log')
   writeFileSync(probeLog, '')
   const server = spawn('npx', ['next', 'start', '-p', String(PORT), '-H', '127.0.0.1'], {
     cwd: ROOT,
@@ -675,7 +725,10 @@ async function checkServedResponses() {
     // reassuring summary alongside a failure is the reporting bug this whole project
     // keeps rediscovering.
     if (probeLeaks === 0) {
-      console.log(`  PROBE ${probed} route(s) rendered anonymously with no tenant data read observed`)
+      // "rendered" overstated it: most of these routes are guarded, so the proxy
+      // redirects and the page never executes. Say what was actually done.
+      console.log(`  PROBE ${probed} route(s) requested anonymously with no tenant data read `
+        + 'observed (guarded routes redirect before rendering; the build is probed separately)')
     }
 
     const dataless = datalessRoutes()
