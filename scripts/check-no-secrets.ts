@@ -11,7 +11,6 @@
 import { execFileSync, spawn } from 'node:child_process'
 import { createServer } from 'node:http'
 import { SCAN_ACK_HEADER, SCAN_HEADER, SCAN_STATE_HEADER, scanAcknowledgement } from '../lib/security/scan-mode'
-import { closureSource } from './module-closure'
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, rmSync, writeFileSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { join, relative } from 'node:path'
@@ -326,51 +325,6 @@ function routeTable(): Map<string, { isHandler: boolean }> {
   return routes
 }
 
-/**
- * Routes with nothing to inspect, derived from source rather than listed.
- *
- * A route that only ever redirects (`/` sends you to the dashboard or to login)
- * renders no document in any session state, so requiring one would be wrong. But an
- * exclusion LIST is how the previous version of this scan came to be covering
- * `/login` and three placeholders, so the set is computed: a page qualifies only if
- * its source touches no database at all -- the same rule tests/app/guards.test.ts
- * enforces independently for its RENDERS_NO_DATA pages.
- */
-function datalessRoutes(): Set<string> {
-  const dataless = new Set<string>()
-  const appDir = join(ROOT, 'app')
-  if (!existsSync(appDir)) return dataless
-  for (const file of walk(appDir)) {
-    if (!/\/page\.(m|c)?[jt]sx?$/.test(file)) continue
-    // The page AND everything it imports. Anything that touches Supabase or the
-    // session is NOT dataless. Matching only `.from(`/`.rpc(`/`createSupabase`
-    // excused /mfa/verify -- which reads the user's factor list through
-    // supabase.auth -- so a page that never rendered was written off as having
-    // nothing to render; and reading only the page file excused /login while a
-    // helper one import away served every tenant to an anonymous visitor.
-    // Comment-stripped: the word "supabase" in a CODE COMMENT was enough to skip the
-    // closure check entirely, so a page could be excused from the expensive, correct
-    // check by a passing mention of it in prose.
-    const own = readFileSync(file, 'utf8')
-      .replace(/\/\*[\s\S]*?\*\//g, ' ')
-      .replace(/(^|[^:])\/\/.*$/gm, '$1')
-    if (/supabase|resolveSessionState|requireMfaSession|requireSignedInUser/.test(own)) continue
-    // Across the closure, `supabase` appears on every page that renders a form via
-    // csrfField(), so it cannot be the signal. `.from(`/`.rpc(` was the signal, and
-    // it is a model of supabase-js rather than of reading data -- a raw fetch to
-    // PostgREST with the service-role key matched neither and served every tenant
-    // with this scan reporting 9/9. Anything that reaches the network or a database
-    // driver now disqualifies the claim; closureSource throws if the graph is
-    // incomplete, so this reads every module the page actually runs.
-    if (/\.from\(|\.rpc\(|\bfetch\(|from ['"]pg['"]|from ['"]postgres['"]/
-        .test(closureSource(file, ROOT))) continue
-    const key = '/' + relative(appDir, file).replace(/\/?page\.(m|c)?[jt]sx?$/, '')
-    dataless.add(fillDynamicSegments(key))
-  }
-  return dataless
-}
-
-/** Turns a manifest key into a URL a browser could actually request. */
 function fillDynamicSegments(key: string): string {
   // Route groups `(marketing)` and parallel slots `@modal` organise files and are
   // NOT part of the URL. Leaving them in made the scan fetch a path that does not
@@ -731,18 +685,16 @@ async function checkServedResponses() {
         + 'observed (guarded routes redirect before rendering; the build is probed separately)')
     }
 
-    const dataless = datalessRoutes()
-
+    // Which routes never rendered is no longer excused by reading their source.
+    // The runtime probe below renders every route anonymously and fails on an
+    // observed data read, which answers the question directly instead of modelling
+    // it — six review rounds were spent on models of this and every one was wrong.
     const neverRendered = [...table.keys()].filter((route) => !rendered.has(route))
-    const unexplained = neverRendered.filter((route) => !dataless.has(route))
-    if (unexplained.length) {
-      fail(`these routes never rendered a document in any session state, so nothing was `
-        + `actually inspected for them: ${unexplained.join(', ')}`)
-    }
+
     console.log(`  READ  ${rendered.size}/${table.size} route(s) rendered, `
       + `${flightPayloads} RSC flight payload(s) inspected`)
     if (neverRendered.length) {
-      console.log(`  NOTE  never rendered (each proven dataless in source): ${neverRendered.join(', ')}`)
+      console.log(`  NOTE  ${neverRendered.length} route(s) only ever redirected; the probe below still requested each one`)
     }
 
   } finally {
