@@ -495,16 +495,37 @@ describe('authorship is set once and never changes', () => {
     })
   })
 
-  test('a trigger pins it even for a caller that bypasses the grant', async () => {
+  test('a trigger stops a caller that bypasses the grant re-pointing authorship', async () => {
     // Belt and braces: the grant stops the app, the trigger stops a worker or a
     // migration running as the owner.
-    let id: string
     await asAdmin(url, async (q) => {
-      id = (await q(`insert into public.posts (business_id, created_by, body) values ($1,$2,'{}') returning id`,
+      const id = (await q(`insert into public.posts (business_id, created_by, body) values ($1,$2,'{}') returning id`,
         [businessA, OWNER])).rows[0].id
-      await q(`update public.posts set created_by = null where id = $1`, [id])
+      await q(`update public.posts set created_by = $1 where id = $2`, [VIEWER, id])
       const after = await q(`select created_by from public.posts where id = $1`, [id])
-      expect(after.rows[0].created_by, 'authorship was erased').toBe(OWNER)
+      expect(after.rows[0].created_by, 'authorship was reassigned').toBe(OWNER)
+    })
+  })
+
+  test('but deleting the author still nulls the column, leaving no dangling reference', async () => {
+    // posts.created_by is ON DELETE SET NULL, and that referential action is carried
+    // out as an UPDATE -- which the pin trigger used to revert. The row then pointed
+    // at a user that no longer existed, a dangling reference Postgres will never
+    // detect because the column ended unchanged, and the reverted update filed a
+    // permanent audit row saying nothing changed. No test deleted an auth.users row,
+    // so a test named "a trigger pins it" certified the broken behaviour.
+    await asAdmin(url, async (q) => {
+      const ghost = '5a5a5a5a-0000-4000-8000-00000000ghst'.replace('ghst', 'aaaa')
+      await q(`insert into auth.users (id, email) values ($1, 'ghost@localhost')`, [ghost])
+      const id = (await q(`insert into public.posts (business_id, created_by, body) values ($1,$2,'{}') returning id`,
+        [businessA, ghost])).rows[0].id
+      await q(`delete from auth.users where id = $1`, [ghost])
+      const after = await q(`select created_by from public.posts where id = $1`, [id])
+      expect(after.rows[0].created_by, 'the author was deleted but the row still points at them').toBeNull()
+      const dangling = await q(`select count(*)::int as n from public.posts p
+        where p.created_by is not null
+          and not exists (select 1 from auth.users u where u.id = p.created_by)`)
+      expect(dangling.rows[0].n, 'a post references a user that does not exist').toBe(0)
     })
   })
 

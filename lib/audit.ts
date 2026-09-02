@@ -1,5 +1,7 @@
 import 'server-only'
 
+import { isIP } from 'node:net'
+
 import { headers } from 'next/headers'
 
 import { createSupabaseAdminClient } from '@/lib/supabase/admin'
@@ -40,31 +42,26 @@ export async function clientIp(): Promise<string | null> {
   candidate ??= headerList.get('x-real-ip')?.trim() ?? null
   if (!candidate) return null
 
-  // Must be something Postgres's `inet` type will actually accept. The old check
-  // was a character-class filter, so values like '....' and '::::' passed here and
-  // then raised "invalid input syntax for type inet" inside the audit write -- a
-  // caller-controlled way to make the audit call throw. An address we cannot parse
-  // is recorded as null; a bad header must never be able to fail a request.
-  if (!isParseableAddress(candidate)) return null
-
-  // Strip an IPv4 port suffix such as "203.0.113.4:51234".
+  // An address we cannot parse is recorded as null; a bad header from an
+  // unauthenticated caller must never be able to fail the request.
+  // Strip an IPv4 port suffix ("203.0.113.4:51234") and IPv6 brackets ("[::1]").
   const withoutPort = /^\d{1,3}(\.\d{1,3}){3}:\d+$/.test(candidate)
     ? candidate.split(':')[0]!
-    : candidate
+    : candidate.replace(/^\[(.+)\]$/, '$1')
 
-  return isParseableAddress(withoutPort) ? withoutPort : null
-}
-
-/** True only for something Postgres's `inet` type will accept. */
-function isParseableAddress(value: string): boolean {
-  const ipv4 = /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/
-  if (ipv4.test(value)) return true
-  // IPv6: hex groups separated by colons, with at most one '::'.
-  if (!/^[0-9a-fA-F:]+$/.test(value)) return false
-  if ((value.match(/::/g) ?? []).length > 1) return false
-  if (/:::/.test(value)) return false
-  const groups = value.split(':').filter((g) => g !== '')
-  return groups.length > 0 && groups.length <= 8 && groups.every((g) => /^[0-9a-fA-F]{1,4}$/.test(g))
+  // net.isIP is Node's own parser and agrees with Postgres's `inet` type. The
+  // hand-rolled regexes it replaces did not, in both directions:
+  //
+  //   "abcd", "1", "1:2:3:4:5:6:7", "beef:"  were ACCEPTED here, then REJECTED by
+  //   Postgres with `invalid input syntax for type inet` -- and because the audit row
+  //   is written BEFORE signInWithPassword, an unauthenticated POST /login returned
+  //   500. A wrong TRUSTED_PROXY_COUNT, or no proxy at all, locks the owner out of
+  //   the only route into the app.
+  //
+  //   "::ffff:198.51.100.7", "[::1]", "::"  were REJECTED here and silently recorded
+  //   as null, so on any dual-stack host the failed-login rows lost the one field
+  //   they exist for.
+  return isIP(withoutPort) !== 0 ? withoutPort : null
 }
 
 /**

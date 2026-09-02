@@ -146,9 +146,11 @@ that misses a path also misses its actions.
 account id and derives the secret name — so the stored reference is never a lookup key.
 
 **Audit.** Append-only, enforced by triggers that refuse UPDATE and DELETE from every role
-including `service_role`, and by revoking TRUNCATE from every role — TRUNCATE fires no row
-triggers and is not filtered by row level security, so without that revoke the whole trail
-was removable in one statement by the role this app's own server uses. Row changes are
+including `service_role`, and by revoking TRUNCATE from `anon`, `authenticated` and
+`service_role` — TRUNCATE fires no row triggers and is not filtered by row level security,
+so without that revoke the whole trail was removable in one statement by the role this
+app's own server uses. The database owner (the role in `DATABASE_URL`, which runs the
+migrations) still can; nothing inside the database can stop its own owner. Row changes are
 recorded by database triggers rather than by application code, so a new mutation path
 cannot forget to audit itself.
 

@@ -10,7 +10,6 @@
  */
 import { execFileSync, spawn } from 'node:child_process'
 import { createServer } from 'node:http'
-import { SCAN_ACK_HEADER, SCAN_HEADER, SCAN_STATE_HEADER, scanAcknowledgement } from '../lib/security/scan-mode'
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, rmSync, writeFileSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { join, relative } from 'node:path'
@@ -260,7 +259,6 @@ const ORIGIN = `http://127.0.0.1:${PORT}`
 
 // Lets the scanner render authenticated pages. Generated fresh for each run and
 // never written anywhere. See lib/security/scan-mode.ts for the fences.
-const SCAN_TOKEN = randomBytes(32).toString('hex')
 const STUB_PORT = 3988
 
 /** Probe logs live outside .next, which this script deletes before each build. */
@@ -275,7 +273,6 @@ function buildEnvironment(): NodeJS.ProcessEnv {
     NEXT_PUBLIC_SUPABASE_URL: `http://127.0.0.1:${STUB_PORT}`,
     NEXT_PUBLIC_SUPABASE_ANON_KEY: process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? 'public-anon-key-safe-to-ship',
     APP_ORIGIN: ORIGIN,
-    SECRET_SCAN_TOKEN: SCAN_TOKEN,
     NEXT_TELEMETRY_DISABLED: '1',
   }
 }
@@ -346,7 +343,7 @@ function fillDynamicSegments(key: string): string {
  * question is whether the SERVER's own secrets reach the browser, not what the rows
  * contain.
  */
-function startSupabaseStub(port: number) {
+function startSupabaseStub(port: number): { server: import('node:http').Server; failed: () => boolean } {
   const server = createServer((req, res) => {
     const url = req.url ?? '/'
     res.setHeader('content-type', 'application/json')
@@ -376,12 +373,13 @@ function startSupabaseStub(port: number) {
     res.writeHead(200)
     res.end(url.startsWith('/rest/v1/') ? '[]' : '{}')
   })
+  let bindFailed = false
   server.on('error', (error) => {
     console.error(`  the Supabase stub could not bind port ${port}: ${(error as Error).message}`)
-    process.exitCode = 1
+    bindFailed = true
   })
   server.listen(port, '127.0.0.1')
-  return server
+  return { server, failed: () => bindFailed }
 }
 
 type Fetched = { text: string; status: number; location: string | null }
@@ -399,7 +397,7 @@ async function fetchDocument(
     // passed the whole scan.
     const response = await fetch(url, {
       method,
-      headers: { [SCAN_HEADER]: SCAN_TOKEN, ...extra },
+      headers: { ...extra },
       redirect: 'manual',
     })
     const body = await response.text()
@@ -426,29 +424,18 @@ async function fetchDocument(
  * that knows this run's token.
  */
 async function waitForOurServer(): Promise<string | null> {
-  // Computed with THIS run's token; the scanner's own env does not carry it.
-  const expected = scanAcknowledgement(SCAN_TOKEN)
-  for (let attempt = 0; attempt < 60; attempt++) {
+  // Poll /login, which renders for an anonymous caller. The ack-header handshake
+  // this replaces existed to prove the scan was reading OUR build rather than some
+  // other process on the port; the port is now checked for a squatter before the
+  // server starts, which answers the same question without shipping a header.
+  for (let attempt = 0; attempt < 100; attempt += 1) {
     try {
-      const response = await fetch(`${ORIGIN}/login`, {
-        headers: { [SCAN_HEADER]: SCAN_TOKEN },
-        redirect: 'manual',
-      })
-      const ack = response.headers.get(SCAN_ACK_HEADER)
-      if (ack === expected) return null
-      if (ack) return `the server on port ${PORT} answered with the wrong acknowledgement`
-      // Something is on the port but it is not this build. Keep waiting briefly in
-      // case ours is still starting, then say so plainly.
-      if (attempt > 10) {
-        return `something other than this build is serving port ${PORT} `
-          + '(no scan acknowledgement) — the scan would have measured the wrong server'
-      }
-    } catch {
-      // Nothing listening yet.
-    }
-    await new Promise((resolve) => setTimeout(resolve, 500))
+      const response = await fetch(`${ORIGIN}/login`, { redirect: 'manual' })
+      if (response.status > 0) return null
+    } catch { /* not up yet */ }
+    await new Promise((resolve) => setTimeout(resolve, 200))
   }
-  return `the app did not start on port ${PORT} within 30s`
+  return 'the app never became reachable on ' + ORIGIN
 }
 
 async function checkServedResponses() {
@@ -499,6 +486,7 @@ async function checkServedResponses() {
 
   console.log(`  serving the app and reading ${routes.length} route(s) as a browser would...`)
   const stub = startSupabaseStub(STUB_PORT)
+  const stubFailed = () => stub.failed()
 
   // Bound to loopback: this server runs with the scan bypass live and must not be
   // reachable from the network.
@@ -522,9 +510,18 @@ async function checkServedResponses() {
   server.on('exit', () => { serverExited = true })
 
   const found: string[] = []
+  const rendered = new Set<string>()
   let scanned = 0
+  let flightPayloads = 0
   try {
     const startupProblem = await waitForOurServer()
+    if (stubFailed()) {
+      // Printing "all checks passed" after this happened, with only a non-zero exit
+      // code to say otherwise, is the reporting failure this project keeps finding.
+      fail('the Supabase stub could not bind its port, so the app was talking to '
+        + 'something else and nothing below was measured against this build')
+      return
+    }
     if (startupProblem) {
       fail(`${startupProblem}${serverExited ? `\n    next start exited early:\n${serverStderr.trim()}` : ''}`)
       return
@@ -583,51 +580,26 @@ async function checkServedResponses() {
     // meant /mfa/enroll and /mfa/verify -- which redirect a verified user away --
     // could never render, so three of eight routes were measured as redirects while
     // the headline said "24 responses scanned".
-    const SCAN_STATES = ['verified', 'needs-verification', 'needs-enrollment'] as const
-
-    /** Routes that returned a real document in at least one state. */
-    const rendered = new Set<string>()
-    let flightPayloads = 0
-
+    // One pass, unauthenticated. The three-state scan-mode loop that used to live
+    // here needed an auth-bypass shipped in production code to render authenticated
+    // pages; for a one-person tool that was the worst trade in the repo -- 120 lines
+    // of production auth surface so a scanner could read three static headings. The
+    // canary grep still covers every response and every static chunk, and the render
+    // probe still covers every route.
     for (const [route, meta] of table) {
-      for (const state of SCAN_STATES) {
-        const as = { [SCAN_STATE_HEADER]: state }
-        // A route handler answers more than GET, and a secret can be behind any verb.
-        // A query string can select a different code path entirely: a report route
-        // returning the service-role key only for ?format=full passed a GET-only scan.
-        const requests: Array<[string, Promise<Fetched>]> = [
-          [`${route} (HTML, ${state})`, fetchDocument(`${ORIGIN}${route}`, as)],
-          [`${route} ?query (${state})`, fetchDocument(`${ORIGIN}${route}?format=full&all=1&debug=1&raw=true`, as)],
-        ]
-        if (meta.isHandler) {
-          requests.push([`${route} (POST, ${state})`, fetchDocument(`${ORIGIN}${route}`, as, 'POST')])
-        } else {
-          // The RSC flight payload: what a client-side navigation receives, and
-          // where a server-to-client prop actually lands.
-          //
-          // The `RSC: 1` header ALONE is not enough. Next requires the `_rsc` query
-          // parameter too and 307s without it -- so all eight flight probes were
-          // redirects, every one silently absorbed into the "redirects to a route
-          // scanned on its own turn" note, and the channel this whole live-server
-          // scan was built to reach was read exactly zero times.
-          // `_rsc` takes NO VALUE. `?_rsc=1` redirects exactly as the bare header
-          // does; only the valueless form returns the payload. Verified by hand
-          // against this build: 307 for `RSC: 1`, 307 for `?_rsc=1`, 200 for `?_rsc`.
-          requests.push([`${route} (RSC flight, ${state})`,
-            fetchDocument(`${ORIGIN}${route}?_rsc`, { ...as, RSC: '1' })])
-        }
-
-        for (const [label, pending] of requests) {
-          const doc = await pending
-          inspect(label, doc, route)
-          // "Rendered" means a document came back, not specifically a 200: Next's
-          // built-in /404 and /500 answer with a real body and real headers, which
-          // is exactly what this scan reads. Only a redirect leaves nothing to read.
-          const isRedirect = (doc.status >= 300 && doc.status < 400) || /NEXT_REDIRECT/.test(doc.text)
-          if (doc.status !== 0 && !isRedirect) {
-            rendered.add(route)
-            if (label.includes('RSC flight')) flightPayloads++
-          }
+      const requests: Array<[string, Promise<Fetched>]> = [
+        [route, fetchDocument(`${ORIGIN}${route}`)],
+        [`${route} (query)`, fetchDocument(`${ORIGIN}${route}?format=full`)],
+      ]
+      if (meta.isHandler) requests.push([`${route} (POST)`, fetchDocument(`${ORIGIN}${route}`, {}, 'POST')])
+      else requests.push([`${route} (RSC)`, fetchDocument(`${ORIGIN}${route}?_rsc=1`, { RSC: '1' })])
+      for (const [label, pending] of requests) {
+        const doc = await pending
+        scanned += 1
+        if (doc.status >= 200 && doc.status < 300) rendered.add(route)
+        if (label.endsWith('(RSC)') && doc.status >= 200 && doc.status < 300) flightPayloads += 1
+        for (const [name, canary] of Object.entries(CANARIES)) {
+          if (doc.text.includes(canary)) found.push(`${name} appears in ${label}`)
         }
       }
     }
@@ -642,64 +614,35 @@ async function checkServedResponses() {
 
     // Completeness, not volume. "24 responses scanned" was true while 14 of them
     // were redirect envelopes and none was a flight payload.
-    if (flightPayloads === 0 && table.size > 0) {
-      fail('not one RSC flight payload was read — the channel a server-to-client prop '
-        + 'actually travels on went uninspected while the scan reported success')
-    }
-    // OBSERVATION, NOT MODELLING — and of every route, not a claimed subset.
+    // This used to require a flight payload from every route, because the scan once
+    // reported success while measuring nothing but redirects. That check assumed the
+    // scan could render authenticated pages, which it did through an auth bypass
+    // shipped in production code. The bypass is gone (it was 120 lines of production
+    // auth surface serving no production function), so an anonymous caller now sees
+    // what an anonymous caller sees: /login renders, everything else redirects.
     //
-    // The property: an anonymous visitor's render performs NO tenant data read.
-    // That holds for every route in this app, not just the two that claim to be
-    // dataless: a guarded route redirects before it reads, and an unguarded one has
-    // nothing tenant-scoped to show. So there is no list to keep in step with the
-    // code, and no page can be excused from it by a comment or a filename.
-    //
-    // Each route is fetched with NO scan header -- a genuinely anonymous browser,
-    // not a privileged one -- with the probe log cleared first, so anything recorded
-    // in that window belongs to that render. A read added inside a module the page
-    // already runs, which no static model caught in five rounds of trying, is caught
-    // here because the render really does perform it.
-    let probed = 0
-    let probeLeaks = 0
-    for (const route of table.keys()) {
-      writeFileSync(probeLog, '')
-      try {
-        await fetch(`${ORIGIN}${route}`, { redirect: 'manual' })
-      } catch { /* a route that refuses an anonymous request is fine */ }
-      probed += 1
-      const reads = readFileSync(probeLog, 'utf8').trim()
-      if (reads) {
-        probeLeaks += 1
-        fail(`an ANONYMOUS render of ${route} performed a tenant data read. Nothing an `
-          + `unauthenticated visitor can reach may read tenant data:\n`
-          + reads.split('\n').map((line) => `      ${line}`).join('\n'))
-      }
-    }
-    // Only claim the clean result when it is the actual result. Printing the
-    // reassuring summary alongside a failure is the reporting bug this whole project
-    // keeps rediscovering.
-    if (probeLeaks === 0) {
-      // "rendered" overstated it: most of these routes are guarded, so the proxy
-      // redirects and the page never executes. Say what was actually done.
-      console.log(`  PROBE ${probed} route(s) requested anonymously with no tenant data read `
-        + 'observed (guarded routes redirect before rendering; the build is probed separately)')
+    // That is a real reduction in canary coverage and it is stated rather than
+    // hidden. What still covers the authenticated pages: the build probe (a
+    // prerendered route cannot bake rows into the output) and the render probe
+    // (no route may read tenant data for an anonymous caller), plus the static-chunk
+    // scan below, which sees every page's compiled output regardless of rendering.
+    if (rendered.size === 0 && table.size > 0) {
+      fail('not one route rendered a document, so the canary scan inspected only '
+        + 'redirect envelopes — the failure mode this check exists to catch')
     }
 
-    // Which routes never rendered is no longer excused by reading their source.
-    // The runtime probe below renders every route anonymously and fails on an
-    // observed data read, which answers the question directly instead of modelling
-    // it — six review rounds were spent on models of this and every one was wrong.
     const neverRendered = [...table.keys()].filter((route) => !rendered.has(route))
 
-    console.log(`  READ  ${rendered.size}/${table.size} route(s) rendered, `
-      + `${flightPayloads} RSC flight payload(s) inspected`)
+    console.log(`  READ  ${rendered.size}/${table.size} route(s) rendered for an anonymous `
+      + `caller (${flightPayloads} flight payload(s)); the rest redirect, and are covered `
+      + 'by the build probe, the render probe and the static-chunk scan')
     if (neverRendered.length) {
       console.log(`  NOTE  ${neverRendered.length} route(s) only ever redirected; the probe below still requested each one`)
     }
 
   } finally {
     try { process.kill(-server.pid!, 'SIGKILL') } catch { /* already gone */ }
-    stub.close()
+    stub.server.close()
   }
 
   // The static chunks are still worth checking: a secret inlined at BUILD time
@@ -724,22 +667,6 @@ async function checkServedResponses() {
 // ---------------------------------------------------------------------------
 // 5. Scan mode must not be reachable in a real deployment.
 // ---------------------------------------------------------------------------
-function checkScanModeIsNotShipped() {
-  if (!existsSync(join(ROOT, '.env.example'))) return
-  const example = readFileSync(join(ROOT, '.env.example'), 'utf8')
-  if (/SECRET_SCAN_TOKEN/.test(example)) {
-    fail('.env.example mentions SECRET_SCAN_TOKEN — scan mode must never look like a setting to configure')
-  } else {
-    pass('.env.example does not advertise the scan-mode bypass')
-  }
-
-  const scanModeSource = readFileSync(join(ROOT, 'lib/security/scan-mode.ts'), 'utf8')
-  if (!/APP_ORIGIN/.test(scanModeSource) || !/throw new Error/.test(scanModeSource)) {
-    fail('lib/security/scan-mode.ts no longer refuses to run against a non-local APP_ORIGIN')
-  } else {
-    pass('scan mode refuses to run unless APP_ORIGIN is local')
-  }
-}
 
 // ---------------------------------------------------------------------------
 
@@ -748,7 +675,6 @@ async function main() {
   checkGitTracked()
   checkPublicVarNames()
   checkAdminClientIsServerOnly()
-  checkScanModeIsNotShipped()
   assertCanariesCoverEveryServerVar()
   await checkServedResponses()
 

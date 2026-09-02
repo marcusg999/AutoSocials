@@ -81,7 +81,18 @@ language plpgsql
 set search_path = ''
 as $$
 begin
-  new.created_by := old.created_by;
+  -- Re-pointing authorship at someone else is forbidden. Clearing it is not.
+  --
+  -- posts.created_by is declared ON DELETE SET NULL, and that referential action is
+  -- carried out as an UPDATE -- which this trigger reverted, so deleting the author
+  -- left the row pointing at a user that no longer exists, a dangling reference
+  -- Postgres will never detect because the column ended unchanged. It also fired the
+  -- audit trigger, filing a permanent posts.update row with changed_columns: [] for
+  -- a change that did not happen. (Verified: businesses.created_by, same constraint
+  -- and no pin trigger, nulls out correctly.)
+  if new.created_by is distinct from old.created_by and new.created_by is not null then
+    new.created_by := old.created_by;
+  end if;
   return new;
 end;
 $$;
