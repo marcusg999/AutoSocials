@@ -94,12 +94,6 @@ describe('the origin check cannot be talked around', () => {
       .rejects.toThrow(/neither Origin nor Referer/i)
   })
 
-  test('in production, an unset APP_ORIGIN fails closed rather than open', async () => {
-    delete process.env.APP_ORIGIN
-    const token = createCsrfToken(signedInUserId)
-    await expect(assertCsrf(submission({ cookie: token, field: token, origin: OUR_ORIGIN })))
-      .rejects.toThrow(/APP_ORIGIN must be set/i)
-  })
 })
 
 describe('the token cannot be forged or planted', () => {
@@ -262,3 +256,8 @@ test('no token is ever placed anywhere the browser could read it', async () => {
     /localStorage|sessionStorage/.test(readFileSync(file, 'utf8')))
   expect(offenders, 'tokens must never be stored in web storage').toEqual([])
 })
+
+// Round 15: dropped the unset-APP_ORIGIN case, which duplicates the throw
+// next.config.ts already performs at build time. Origin checking, token forgery,
+// subject binding and expiry stay -- CSRF is one of the three things here that
+// still faces a real adversary.

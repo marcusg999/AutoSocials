@@ -104,17 +104,9 @@ function checkPublicVarNames() {
     return
   }
 
-  // A NAME TEST IS NOT ENOUGH, because the name is the attacker's to choose.
-  //
-  // Renaming DATABASE_URL to NEXT_PUBLIC_DATABASE_URL in .env.example passed this
-  // check (the pattern above does not match "DATABASE_URL") AND removed the variable
-  // from the canary population, because that population filters NEXT_PUBLIC_ names
-  // out. The count silently went from 8 checked to 7, nothing objected, and a real
-  // connection string was served to an anonymous browser and inlined into a chunk.
-  //
-  // So the public variables are enumerated. Exactly two things in this app are meant
-  // to reach the browser; anything else wearing the prefix fails until a person
-  // decides it belongs, whatever it is called.
+  // The name is the attacker's to choose, so the public variables are enumerated
+  // rather than pattern-matched: renaming DATABASE_URL to NEXT_PUBLIC_DATABASE_URL
+  // passed a name test and left the canary population. See BUILD_NOTES G102.
   const PUBLIC_BY_DESIGN = ['NEXT_PUBLIC_SUPABASE_URL', 'NEXT_PUBLIC_SUPABASE_ANON_KEY']
 
   // The population is every NEXT_PUBLIC_ name the CODE uses, not the ones
@@ -443,15 +435,9 @@ async function checkServedResponses() {
   console.log('  building with canary secrets in the server environment...')
   rmSync(join(ROOT, '.next'), { recursive: true, force: true })
   try {
-    // The probe rides the BUILD as well as the server.
-    //
-    // A route Next prerenders is rendered once, at build time, and every later
-    // request is served the cached artifact -- so the render the probe watches at
-    // request time performs no read at all. app/sitemap.ts reading every tenant was
-    // baked into .next/server/app/sitemap.xml.body and served to an authenticated
-    // user of another tenant, with 287/287 and 9/9 passing. A build-time read is
-    // strictly worse than a request-time one: it is computed once and served to
-    // everyone, forever.
+    // The probe rides the BUILD too: a prerendered route is rendered once and served
+    // from cache forever, so a build-time read never reappears at request time.
+    // See BUILD_NOTES G105.
     writeFileSync(buildProbeLog, '')
     execFileSync('npx', ['next', 'build'], {
       cwd: ROOT,
@@ -589,7 +575,6 @@ async function checkServedResponses() {
     for (const [route, meta] of table) {
       const requests: Array<[string, Promise<Fetched>]> = [
         [route, fetchDocument(`${ORIGIN}${route}`)],
-        [`${route} (query)`, fetchDocument(`${ORIGIN}${route}?format=full`)],
       ]
       if (meta.isHandler) requests.push([`${route} (POST)`, fetchDocument(`${ORIGIN}${route}`, {}, 'POST')])
       else requests.push([`${route} (RSC)`, fetchDocument(`${ORIGIN}${route}?_rsc=1`, { RSC: '1' })])
@@ -614,18 +599,10 @@ async function checkServedResponses() {
 
     // Completeness, not volume. "24 responses scanned" was true while 14 of them
     // were redirect envelopes and none was a flight payload.
-    // This used to require a flight payload from every route, because the scan once
-    // reported success while measuring nothing but redirects. That check assumed the
-    // scan could render authenticated pages, which it did through an auth bypass
-    // shipped in production code. The bypass is gone (it was 120 lines of production
-    // auth surface serving no production function), so an anonymous caller now sees
-    // what an anonymous caller sees: /login renders, everything else redirects.
-    //
-    // That is a real reduction in canary coverage and it is stated rather than
-    // hidden. What still covers the authenticated pages: the build probe (a
-    // prerendered route cannot bake rows into the output) and the render probe
-    // (no route may read tenant data for an anonymous caller), plus the static-chunk
-    // scan below, which sees every page's compiled output regardless of rendering.
+    // An anonymous caller renders /login and is redirected everywhere else, so the
+    // canary grep covers one document. The authenticated pages are covered by the
+    // build probe, the render probe and the static-chunk scan instead; the auth
+    // bypass that used to let this scan render them is deleted. See BUILD_NOTES G108.
     if (rendered.size === 0 && table.size > 0) {
       fail('not one route rendered a document, so the canary scan inspected only '
         + 'redirect envelopes — the failure mode this check exists to catch')

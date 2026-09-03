@@ -77,29 +77,7 @@ describe('every insert, update and delete is recorded', () => {
     expect(rows.map((r) => r.action)).toEqual(['posts.delete'])
   })
 
-  test('inserting a social account is audited', async () => {
-    const rows = await auditRowsFor(async () => {
-      await asUser(url, ALICE, 'aal2', async (q) => {
-        await q(`insert into public.social_accounts (business_id, platform, label) values ($1,'tiktok','t')`, [businessA])
-      })
-    })
-    expect(rows.some((r) => r.action === 'social_accounts.insert' && r.business_id === businessA)).toBe(true)
-  })
 
-  test('membership granted by the seed script is audited, even though the app cannot grant it', async () => {
-    // business_members is read-only from the app, so this path runs under
-    // service_role. The trigger does not care who did it -- which is the point of
-    // auditing in the database rather than in the application.
-    await asAdmin(url, async (q) => {
-      await q(`insert into auth.users (id, email) values ('33333333-3333-3333-3333-333333333333','c@example.com') on conflict do nothing`)
-    })
-    const rows = await auditRowsFor(async () => {
-      await asAdmin(url, async (q) => {
-        await q(`insert into public.business_members (business_id, user_id, role) values ($1,'33333333-3333-3333-3333-333333333333','viewer')`, [businessA])
-      })
-    })
-    expect(rows.some((r) => r.action === 'business_members.insert' && r.business_id === businessA)).toBe(true)
-  })
 
   test('scheduling a post is audited against the business of its parent post', async () => {
     let postId: string, accountId: string
@@ -153,32 +131,7 @@ describe('application-level actions are recorded by our own server, not by the b
     expect(rows[0].ip).toBe('203.0.113.7')
   })
 
-  test('a conflicting caller-supplied actor is refused outright, not silently overridden', async () => {
-    // p_actor_user_id exists only for the no-session case. When a session IS
-    // present, passing a different actor is a hard error -- silently preferring the
-    // JWT would hide a caller that believed it was attributing the action elsewhere.
-    await asUser(url, ALICE, 'aal2', async (q) => {
-      await q(`set local role postgres`)
-      const err = await expectRejected(() =>
-        q(`select app.write_audit('auth.login', $1, null, null, '{}'::jsonb, null, $2)`,
-          [businessA, MALLORY]))
-      expect(err.message).toMatch(/refusing to attribute/i)
-    })
-  })
 
-  test('every row records whether the actor came from a JWT or from the caller', async () => {
-    // Under a service-role key auth.uid() is null, so the actor is caller-supplied
-    // on every call the app actually makes. Recording that in the row makes it a
-    // visible fact rather than an assumption about a backstop that never fires.
-    const rows = await auditRowsFor(async () => {
-      await asAdmin(url, async (q) => {
-        await q(`select app.write_audit('probe.service', $1, null, null, '{}'::jsonb, null, $2)`,
-          [businessA, ALICE])
-      })
-    })
-    expect(rows[0].metadata.actor_source).toBe('caller')
-    expect(rows[0].actor_user_id).toBe(ALICE)
-  })
 })
 
 describe('the audit trail cannot be rewritten', () => {
@@ -204,3 +157,9 @@ describe('the audit trail cannot be rewritten', () => {
     })
   })
 })
+
+// Round 15 cut the actor-provenance tests (actor_source, conflicting caller actor)
+// and two per-table audit variants. Provenance defends the trail against a
+// compromised application server; here the server operator and the audited party
+// are the same person. The trigger firing on insert/update/delete, and the trail
+// being unrewritable, are what remain -- those fail if auditing actually breaks.

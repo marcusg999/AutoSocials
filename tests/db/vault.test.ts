@@ -38,19 +38,7 @@ test('storing a credential puts a reference on the row, never the secret', async
   })
 })
 
-test('the secret is not stored in plaintext anywhere in the vault table', async () => {
-  await asAdmin(url, async (q) => {
-    const row = (await q(`select secret from vault.secrets limit 1`)).rows[0]
-    expect(row.secret).not.toContain(SECRET)
-  })
-})
 
-test('a trusted server-side caller can read the credential back', async () => {
-  await asAdmin(url, async (q) => {
-    const r = await q(`select app.read_account_credential($1) as v`, [accountId])
-    expect(r.rows[0].v).toBe(SECRET)
-  })
-})
 
 describe('a signed-in browser session cannot reach the Vault', () => {
   test('a member of the business still cannot execute read_account_credential', async () => {
@@ -74,22 +62,9 @@ describe('a signed-in browser session cannot reach the Vault', () => {
     })
   })
 
-  test('reading the social account the normal way returns only the reference', async () => {
-    await asUser(url, ALICE, 'aal2', async (q) => {
-      const rows = (await q(`select * from public.social_accounts`)).rows
-      expect(rows).toHaveLength(1)
-      expect(JSON.stringify(rows)).not.toContain(SECRET)
-      expect(rows[0].encrypted_credential_ref).toBe('social_account_' + accountId.replace(/-/g, ''))
-    })
-  })
 })
 
-test('the reference column refuses to hold anything that looks like a credential', async () => {
-  // A guard rail against someone later writing the token into the wrong column.
-  await asAdmin(url, async (q) => {
-    const err = await expectRejected(() =>
-      q(`update public.social_accounts set encrypted_credential_ref = $1 where id = $2`,
-        ['EAABw3ZC8verylongfacebooktokenvaluethatwouldbeacredential0123456789ABCDEF', accountId]))
-    expect(err.message).toMatch(/social_accounts_credential_ref_is_a_reference/)
-  })
-})
+// Round 15: phase 1 stores no credentials at all -- social_accounts is empty and
+// these functions have no caller in app/ or lib/. What is kept is the property that
+// matters if phase 2 does start storing them: a browser session cannot reach the
+// Vault. The round-trip tests come back when there is a round trip to test.
