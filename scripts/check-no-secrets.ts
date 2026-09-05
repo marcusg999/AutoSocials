@@ -203,6 +203,7 @@ const CANARIES = {
   DATABASE_URL: 'postgresql://postgres:CANARY_DB_PASSWORD_9f8e7d6c@127.0.0.1:5432/postgres',
   ADMIN_PASSWORD: 'CANARY_ADMIN_PASSWORD_3c2d1e0f98877665',
   ADMIN_EMAIL: 'canary-admin-4b3c2d1e@localhost',
+  META_APP_SECRET: 'CANARY_META_APP_SECRET_7d6c5b4a39281706',
 } as const
 
 /**
@@ -210,6 +211,8 @@ const CANARIES = {
  * app parses them and a canary value would stop it starting. Each needs a reason.
  */
 const NOT_CANARYABLE: Record<string, string> = {
+  META_APP_ID: 'the app id appears in the OAuth authorization URL by design; it is '
+    + 'public, and Meta treats it as such. The secret beside it IS canaried.',
   // Compared against the request origin; a canary value fails every CSRF check.
   APP_ORIGIN: 'an origin the app must match against real requests',
   // Parsed as a number.
@@ -562,10 +565,6 @@ async function checkServedResponses() {
       }
     }
 
-    // Every session state the app can render in. Scanning only as a verified user
-    // meant /mfa/enroll and /mfa/verify -- which redirect a verified user away --
-    // could never render, so three of eight routes were measured as redirects while
-    // the headline said "24 responses scanned".
     // One pass, unauthenticated. The three-state scan-mode loop that used to live
     // here needed an auth-bypass shipped in production code to render authenticated
     // pages; for a one-person tool that was the worst trade in the repo -- 120 lines
@@ -599,6 +598,35 @@ async function checkServedResponses() {
 
     // Completeness, not volume. "24 responses scanned" was true while 14 of them
     // were redirect envelopes and none was a flight payload.
+    // THE RUNTIME PROBE. Every route, requested anonymously, with the probe log
+    // cleared first so anything recorded in that window belongs to that render.
+    //
+    // This answers "did this render read tenant data" by observation. Six review
+    // rounds were spent on static models of the same question and every one turned
+    // out narrower than the property; see BUILD_NOTES G101/G105. It was deleted by
+    // accident while cutting the apparatus and is restored here -- losing it was
+    // worse than everything the cut removed put together.
+    let probed = 0
+    let probeLeaks = 0
+    for (const route of table.keys()) {
+      writeFileSync(probeLog, '')
+      try {
+        await fetch(`${ORIGIN}${route}`, { redirect: 'manual' })
+      } catch { /* a route that refuses an anonymous request is fine */ }
+      probed += 1
+      const reads = readFileSync(probeLog, 'utf8').trim()
+      if (reads) {
+        probeLeaks += 1
+        fail(`an ANONYMOUS render of ${route} performed a tenant data read. Nothing an `
+          + `unauthenticated visitor can reach may read tenant data:\n`
+          + reads.split('\n').map((line) => `      ${line}`).join('\n'))
+      }
+    }
+    if (probeLeaks === 0) {
+      console.log(`  PROBE ${probed} route(s) requested anonymously with no tenant data read `
+        + 'observed (guarded routes redirect before rendering; the build is probed separately)')
+    }
+
     // An anonymous caller renders /login and is redirected everywhere else, so the
     // canary grep covers one document. The authenticated pages are covered by the
     // build probe, the render probe and the static-chunk scan instead; the auth

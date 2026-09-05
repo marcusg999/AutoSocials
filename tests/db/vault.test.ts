@@ -68,3 +68,40 @@ describe('a signed-in browser session cannot reach the Vault', () => {
 // these functions have no caller in app/ or lib/. What is kept is the property that
 // matters if phase 2 does start storing them: a browser session cannot reach the
 // Vault. The round-trip tests come back when there is a round trip to test.
+
+describe('disconnecting removes the credential, not just the link', () => {
+  test('delete_account_credential removes the secret and audits it', async () => {
+    await asAdmin(url, async (q) => {
+      await q(`select app.store_account_credential($1, 'page-token-to-be-revoked')`, [accountId])
+      const before = await q(`select count(*)::int as n from vault.secrets where name = app.credential_name_for($1)`, [accountId])
+      expect(before.rows[0].n, 'nothing was stored to begin with').toBe(1)
+
+      await q(`select app.delete_account_credential($1)`, [accountId])
+
+      const after = await q(`select count(*)::int as n from vault.secrets where name = app.credential_name_for($1)`, [accountId])
+      expect(after.rows[0].n, 'a disconnected account left a live provider token in the Vault').toBe(0)
+
+      const audit = await q(`select count(*)::int as n from public.audit_log
+        where action = 'connector.credential.deleted' and target_id = $1`, [accountId])
+      expect(audit.rows[0].n, 'the deletion was not recorded').toBe(1)
+    })
+  })
+
+  test('a signed-in browser session cannot execute it', async () => {
+    // Same rule as the rest of the Vault surface: no path from a browser, in any
+    // direction. Deleting somebody's credential is a denial of service if it is
+    // reachable, so it is not.
+    await asUser(url, ALICE, 'aal2', async (q) => {
+      const err = await expectRejected(() => q(`select app.delete_account_credential($1)`, [accountId]))
+      expect(err.message).toMatch(/permission denied/i)
+    })
+  })
+
+  test('it refuses an id that is not a real account rather than silently succeeding', async () => {
+    await asAdmin(url, async (q) => {
+      const err = await expectRejected(() =>
+        q(`select app.delete_account_credential('99999999-9999-4999-8999-999999999999')`))
+      expect(err.message).toMatch(/no such social account/i)
+    })
+  })
+})

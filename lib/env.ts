@@ -39,3 +39,38 @@ export function supabaseOrigin(): string | null {
     return null
   }
 }
+
+/**
+ * The Meta (Facebook / Instagram) app credentials.
+ *
+ * Read only on the server, and only from here. Server actions are forbidden from
+ * touching process.env at all — an action has several ways to hand a value to the
+ * browser (a redirect target, a cookie, a header) and the secret scan reads none of
+ * them, so the rule is enforced on the action module and configuration arrives
+ * through a function like this one instead.
+ */
+export function metaAppCredentials(): { appId: string; appSecret: string } {
+  return {
+    appId: required('META_APP_ID', process.env.META_APP_ID),
+    appSecret: required('META_APP_SECRET', process.env.META_APP_SECRET),
+  }
+}
+
+/** True when a Meta app is configured at all, so the UI can say so instead of failing. */
+export function isMetaConfigured(): boolean {
+  return Boolean(process.env.META_APP_ID && process.env.META_APP_SECRET)
+}
+
+/**
+ * The OAuth redirect target, derived from APP_ORIGIN rather than from the request.
+ *
+ * Deriving it from a request header would let a caller choose where the provider
+ * sends the code. It is the same reason the CSRF origin allowlist reads APP_ORIGIN
+ * and never trusts a forwarded header.
+ */
+export function appOrigin(): string {
+  const configured = process.env.APP_ORIGIN?.split(',')[0]?.trim()
+  if (configured) return configured
+  if (isProduction()) throw new Error('APP_ORIGIN must be set in production')
+  return 'http://127.0.0.1:3000'
+}
