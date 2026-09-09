@@ -1,20 +1,32 @@
 # PostDeck
 
-A multi-tenant social media scheduling tool. **Phase 1 of 5 is built: the security and
-tenancy spine only.** There is no publishing, no scheduling, and no social-platform
-code yet — those arrive in later phases.
+A multi-tenant social media scheduling tool. **Phases 1-4 of 5 are built.** Phase 5, the
+AI assistant, is not started.
 
-What works today: an administrator can sign in with a password and a TOTP code, see the
-businesses they belong to, and switch the active one. Everything else is a placeholder
-that proves its own session and renders nothing.
+What works today: sign in with a password and a TOTP code, connect Facebook Pages and
+Instagram business accounts through Meta OAuth, write a post, save it as a draft or
+schedule it to several accounts at once, watch it on a calendar, move it or cancel it —
+and a worker publishes what is due. All times are UTC.
+
+| Phase | What it added | State |
+|---|---|---|
+| 1 | Security and tenancy spine: RLS, mandatory TOTP, Vault, audit log | Built |
+| 2 | The Meta connector: OAuth, per-Page tokens, connect and disconnect | Built |
+| 3 | Scheduling and publishing: the claim, the worker, composer and calendar | Built |
+| 4 | Dashboard, drafts, editing and rescheduling | Built |
+| 5 | AI assistant | Not started |
 
 ## Requirements
 
 - Node.js 20 or newer
-- A Supabase project (for auth), plus a Postgres database you can reach directly
-- `psql` is not required; the migration runner connects over `DATABASE_URL`
+- A Supabase project — this is where auth (and therefore TOTP) lives, and there is no
+  offline substitute for it
+- A Postgres database the migration runner can reach directly over `DATABASE_URL`.
+  Supabase's own database is the simplest choice: its connection string is under
+  Project settings → Database.
+- `psql` is not needed. `scripts/migrate.ts` connects with the `pg` driver.
 
-## Getting it running
+## Running it locally
 
 **1. Install and configure.**
 
@@ -48,7 +60,7 @@ The `db:*` and `seed:admin` scripts read `.env.local` themselves (via Node's
 npm run db:up
 ```
 
-This applies thirteen migrations in order and seeds seven businesses, `BUSINESS_1` through
+This applies every migration in order and seeds seven businesses, `BUSINESS_1` through
 `BUSINESS_7`. It is idempotent — running it twice is safe. `npm run db:down` rolls back,
 and refuses to run while `audit_log` has rows unless you set
 `ALLOW_DESTRUCTIVE_ROLLBACK=yes`, because the audit trail is append-only by design.
@@ -77,6 +89,45 @@ Then open http://localhost:3000. You will be redirected to `/login`. After the p
 step you are sent to `/mfa/enroll`, where you scan a QR code with any authenticator app
 and confirm one code. Nothing else in the app renders until that is done — not the
 dashboard, not the placeholders, not a route handler.
+
+**5. Run the worker.**
+
+Nothing is published by the web app. In a second terminal:
+
+```bash
+npm run publish:due
+```
+
+That claims everything due, publishes it, prints a one-line summary and exits. Run it
+again whenever you want another pass — locally that is usually by hand; in production a
+scheduler runs it (see the scheduler section below). If posts sit on the calendar past
+their time, this is the thing that is not running, and the dashboard says so under
+**Overdue**.
+
+### The shortest path to seeing it work
+
+Once the four steps above are done:
+
+1. Sign in, and pick a business with the switcher at the bottom of the dashboard.
+2. **Accounts** → *Connect facebook*. This needs a real Meta app (see the next section).
+   Without one you can still use everything except publishing.
+3. **Composer** → type something, tick an account, set a time a minute or two ahead,
+   **Schedule**. Or **Save as draft** and come back to it from **Drafts**.
+4. **Calendar** → the post is there, grouped under its UTC day, with *Move* and *Cancel*.
+5. Wait for the time to pass, run `npm run publish:due`, and reload the calendar: the row
+   is **Published**, with the id Meta gave it. If it failed, the provider's reason is on
+   the row.
+
+### If something is not working
+
+| What you see | What it usually is |
+|---|---|
+| `ECONNREFUSED` from `npm run db:up` or `npm run test:db` | Postgres is not running, or `DATABASE_URL` / `ADMIN_DATABASE_URL` points somewhere else |
+| Redirected to `/login` forever | The session cookie is not sticking. Check `APP_ORIGIN` matches the URL you are actually using, including the port |
+| `Invalid CSRF token` on every form | `CSRF_SIGNING_SECRET` changed between rendering the form and submitting it, or is under 32 characters |
+| Posts stay `Scheduled` after their time | Nothing is running `npm run publish:due` |
+| A post fails with an image error | Meta fetches the image URL itself, so `localhost` and private addresses cannot work. The composer refuses the obvious ones up front |
+| `npm run verify` fails only in `tests/db` | The database tests need a reachable Postgres; they create and drop their own scratch databases |
 
 ## Connecting a Meta account (Phase 2)
 
@@ -165,6 +216,29 @@ Neither function can be called by a signed-in user. Their UPDATE grant on `sched
 is narrowed to `scheduled_for` alone: you can move a post or cancel it, but declaring one
 published is the worker's job.
 
+## Drafts, editing and the dashboard (Phase 4)
+
+The dashboard leads with what is **wrong**, because this app sends no notifications and
+is the only place anything surfaces: accounts that are no longer connected, posts whose
+time has passed while nothing published them, and posts that failed and gave up. Then
+what is coming next.
+
+A **draft** is a post with no scheduled rows — "scheduled" is a relationship, not a
+flag, so drafts needed no new table. Saving one skips the per-platform rules on purpose:
+a draft is allowed to be half-written, and the accounts it will go to have not been
+chosen yet. Scheduling a draft promotes that same post rather than making a second one.
+
+**Moving** a scheduled post is an UPDATE of `scheduled_for`, which is the only column
+Phase 3 left a human on that table. Everything else about a post's lifecycle belongs to
+the worker.
+
+Editing stops when a post has actually gone out. `0015` adds a trigger that refuses to
+change the body or status of a published post, and refuses to delete it — deleting would
+cascade away the `scheduled_posts` row holding `published_at` and the provider's id,
+which is the only local evidence it was ever published. A column grant could not express
+this, because the fact that decides it lives on a different table. A post that merely
+*failed* stays fully editable: nothing is live, so there is nothing to disagree with.
+
 ## What you will see
 
 | Route | What it does |
@@ -172,9 +246,10 @@ published is the worker's job.
 | `/login` | Email and password. Renders no data. |
 | `/mfa/enroll` | TOTP enrolment. Shown until a verified factor exists. |
 | `/mfa/verify` | TOTP challenge on later sign-ins. |
-| `/dashboard` | Lists the businesses you are a member of, with an active-business switcher. |
-| `/dashboard/composer` | Write a post and schedule it to connected accounts. |
-| `/dashboard/calendar` | Everything scheduled, its status, and the provider's last error. |
+| `/dashboard` | Overview: counts, accounts needing attention, overdue, failed, what is next, and the business switcher. |
+| `/dashboard/composer` | Write a post. Schedule it, or save it as a draft. |
+| `/dashboard/drafts` | Saved but not scheduled. Edit or delete. |
+| `/dashboard/calendar` | Everything scheduled, grouped by UTC day, with move and cancel. |
 | `/dashboard/accounts` | Connect and disconnect social accounts. |
 | `/api/connectors/[platform]/callback` | Where Meta returns the authorization code. Guarded: MFA session required. |
 

@@ -196,6 +196,33 @@ button.secondary {
 .switcher { display: flex; gap: 8px; align-items: flex-end; }
 .switcher .field { flex: 1; margin-bottom: 0; }
 
+/* Phase 4. Rows gained a second control, and the dashboard gained a counts strip. */
+.actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.actions .inline { display: flex; gap: 6px; align-items: center; margin: 0; }
+.actions .inline input[type="datetime-local"] { margin: 0; width: auto; }
+
+.counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 24px;
+}
+
+.counts strong { font-size: 22px; }
+
+.panel h2 {
+  font-size: 15px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin: 0 0 10px;
+}
+
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #14171b;

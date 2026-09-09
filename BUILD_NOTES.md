@@ -1738,6 +1738,88 @@ answered by the `/media` rule and the two-step test asserts against itself.
 Also: the token travels in the POST **body**, not the query string, so it does not land
 in anybody's access logs.
 
+## Gotchas found while building the dashboard and drafts (Phase 4)
+
+### G118 — The grant that was right in Phase 1 became wrong in Phase 4
+
+`grant update (status, body) on posts to authenticated` has been there since `0006` and
+was correct: a post is the user's own content, and content gets rewritten.
+
+Phase 4 is the first phase where a browser can actually *reach* that grant — the composer
+loads a post back and saves over it. And a post is not one thing for its whole life. While
+it is a draft, rewriting it is the entire point. Once it has gone out, the row is the local
+record of something other people can see, and rewriting it produces a record that quietly
+disagrees with reality.
+
+Deleting is the same shape and worse: `scheduled_posts` cascades from `posts`, so deleting
+a published post takes `published_at` and the provider's id with it. The post stays up on
+Facebook; the only local evidence of it is gone.
+
+No column grant can express "editable until published", because the fact that decides it
+lives on a *different table*. So `0015` is a trigger. This is the third time this project
+has landed on the same answer — narrow the grant where the fact is on the row, use a
+trigger where it is not.
+
+### G119 — The exemption that was not written, and why
+
+The obvious shape for the trigger was to check `current_user` and let `service_role`
+through: the worker is the thing that sets `published_at` in the first place, so exempting
+it sounds like the safe default.
+
+It is G104 again — the round that found `service_role` could TRUNCATE the audit log,
+because the control had been reasoned about in terms of who is trusted rather than which
+statement is legitimate. The worker has no reason to rewrite a published post either.
+Written without the exemption, and with a test that asserts the admin client is refused
+too. Not because the worker was going to do this, but because a control with an exception
+is a control plus a way around it, and the exception is what survives into the phase where
+somebody has forgotten why it was there.
+
+### G120 — `$4` used twice, deduced twice, inconsistently
+
+A test helper inserted a scheduled row with `values (..., $4, case when $4 = 'published'
+then now() end)`. Postgres deduced `post_status` for the first use and `text` for the
+second and refused the whole statement: *inconsistent types deduced for parameter $4*.
+
+Nine tests failed on a helper, which reads exactly like nine broken features. Worth
+recording because the fix is not obvious from the message: a parameter is typed once for
+the whole statement, so reusing one across two contexts needs an explicit cast — or, as
+here, the branch moved into TypeScript where it is easier to read anyway.
+
+### G121 — A date heading that depends on the server's locale
+
+`toLocaleDateString('en-GB', ...)` produced *"Wednesday, 9 September 2026"* on this
+machine and the test expected it without the comma. The reflex is to fix the expectation.
+
+That would have been fixing the wrong end. The output depends on the host's ICU build,
+which is not something the operator chose and not something the test can pin down — the
+same code could render differently on Netlify than it does locally, in a heading that sits
+directly above times deliberately fixed to UTC. Twelve month names and seven day names,
+written out. The test now asserts a value that cannot drift.
+
+### G122 — "Overdue" is a feature, not a status
+
+There is no `overdue` state anywhere in the schema, and there should not be: a post whose
+time has passed is still exactly `scheduled`, and adding a status would mean something has
+to write it, which means a job whose own failure is invisible.
+
+It is computed in `lib/dashboard/overview.ts` from `scheduled_for <= now`. The reason it
+earns a section on the dashboard is that this is what a *stopped worker* looks like from
+the operator's chair: no error, no failed row, nothing in the log — just posts that never
+went out. The one failure mode this design has no other way to surface.
+
+### G123 — Two submit buttons, two actions, one form
+
+The composer needs to both schedule and save a draft, and the two do not share validation:
+scheduling demands an account, a time, and content the platform will accept; saving a draft
+demands none of that. Two separate forms would mean duplicating every field and hoping they
+stay in step.
+
+`formAction` on the second button posts the same fields to a different server action, which
+is plain HTML and needs no client JavaScript. The trap avoided: the draft action must not
+inherit the scheduling checks, or "save this half-written thing and come back later" —
+the only reason drafts exist — stops working.
+
+
 ## Known, accepted limitations
 
 Stated plainly rather than left to be discovered.
@@ -1809,3 +1891,12 @@ Stated plainly rather than left to be discovered.
    again by the next run while the first is still in flight. Longer leases delay
    recovery from a dead worker; shorter ones risk exactly this. Five minutes is a
    judgement about Meta's response times, not a proof.
+19. **Nothing here is a calendar grid.** The calendar groups by UTC day in a list, which
+   is honest about what it is. A month view with drag-to-reschedule is a real feature
+   and is not built.
+20. **There is no approval flow**, though `post_status` has had `pending_approval` since
+   `0001`. A single operator approving their own posts is theatre; the enum value is
+   left for a phase that has more than one person in it.
+21. **A published post cannot be edited or deleted through this app at all** — by design
+   (G118), but it does mean a genuinely wrong record has to be fixed in the database by
+   hand, with the audit trail recording that it happened.

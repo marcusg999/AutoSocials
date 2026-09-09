@@ -17,8 +17,9 @@ export default async function DashboardLayout({ children }: { children: ReactNod
         <span className="brand" style={{ margin: 0 }}>
           PostDeck
         </span>
-        <Link href="/dashboard">Businesses</Link>
+        <Link href="/dashboard">Overview</Link>
         <Link href="/dashboard/composer">Composer</Link>
+        <Link href="/dashboard/drafts">Drafts</Link>
         <Link href="/dashboard/calendar">Calendar</Link>
         <Link href="/dashboard/accounts">Accounts</Link>
         <span className="spacer" />

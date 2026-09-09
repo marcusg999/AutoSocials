@@ -2,9 +2,11 @@ import { csrfField } from '@/lib/security/csrf'
 import { requireMfaSession } from '@/lib/security/session'
 import { listBusinesses, resolveActiveBusiness } from '@/lib/business'
 import { parsePostContent } from '@/lib/connectors/content'
-import { formatUtc } from '@/lib/publishing/schedule-time'
+import {
+  dayKeyUtc, formatDayUtc, formatUtc, relativeToNow, toScheduleValue,
+} from '@/lib/publishing/schedule-time'
 
-import { cancelScheduledPostAction } from '../composer/actions'
+import { cancelScheduledPostAction, reschedulePostAction } from '../composer/actions'
 
 export const dynamic = 'force-dynamic'
 
@@ -40,6 +42,14 @@ export default async function CalendarPage({
 
   const forBusiness = (rows ?? []).filter((row) => row.business_id === active?.id)
 
+  // Grouped by UTC day, because a flat list of timestamps is unreadable past about
+  // a dozen rows and the whole point of a calendar is "what is going out that day".
+  const days = new Map<string, typeof forBusiness>()
+  for (const row of forBusiness) {
+    const key = dayKeyUtc(row.scheduled_for)
+    days.set(key, [...(days.get(key) ?? []), row])
+  }
+
   return (
     <main>
       <h1>Calendar</h1>
@@ -48,64 +58,90 @@ export default async function CalendarPage({
       </p>
 
       {params.scheduled ? <div className="panel">Scheduled.</div> : null}
+      {params.moved ? <div className="panel">Moved.</div> : null}
 
-      <div className="panel">
-        {forBusiness.length === 0 ? (
+      {forBusiness.length === 0 ? (
+        <div className="panel">
           <p className="muted">
             Nothing scheduled. Write something in the <a href="/dashboard/composer">Composer</a>.
           </p>
-        ) : (
-          <ul className="rows">
-            {forBusiness.map((row) => {
-              // posts/social_accounts come back as an object or an array depending
-              // on how the join is inferred; normalise rather than trusting one.
-              const post = Array.isArray(row.posts) ? row.posts[0] : row.posts
-              const account = Array.isArray(row.social_accounts)
-                ? row.social_accounts[0]
-                : row.social_accounts
-              const content = parsePostContent(post?.body)
-              const preview = content.text.trim() === ''
-                ? '(image only)'
-                : content.text.slice(0, 80) + (content.text.length > 80 ? '…' : '')
+        </div>
+      ) : (
+        [...days.entries()].map(([dayKey, dayRows]) => (
+          <div className="panel" key={dayKey}>
+            <h2>{formatDayUtc(dayKey)}</h2>
+            <ul className="rows">
+              {dayRows.map((row) => {
+                // posts/social_accounts come back as an object or an array depending
+                // on how the join is inferred; normalise rather than trusting one.
+                const post = Array.isArray(row.posts) ? row.posts[0] : row.posts
+                const account = Array.isArray(row.social_accounts)
+                  ? row.social_accounts[0]
+                  : row.social_accounts
+                const content = parsePostContent(post?.body)
+                const preview = content.text.trim() === ''
+                  ? '(image only)'
+                  : content.text.slice(0, 80) + (content.text.length > 80 ? '…' : '')
 
-              return (
-                <li key={row.id}>
-                  <span>
-                    <strong>{formatUtc(row.scheduled_for)}</strong>
-                    <span className="badge">{STATUS_LABEL[row.status] ?? row.status}</span>
-                    <br />
-                    {preview}
-                    <br />
-                    <span className="muted">
-                      {account?.label ?? 'unknown account'} — {account?.platform ?? '?'}
-                      {row.published_at ? ` · published ${formatUtc(row.published_at)}` : null}
-                      {row.provider_post_ref ? ` · ${row.provider_post_ref}` : null}
-                      {row.attempts > 0 && row.status !== 'published'
-                        ? ` · ${row.attempts} attempt(s)` : null}
+                return (
+                  <li key={row.id}>
+                    <span>
+                      <strong>{formatUtc(row.scheduled_for)}</strong>
+                      <span className="badge">{STATUS_LABEL[row.status] ?? row.status}</span>
+                      {row.status === 'scheduled'
+                        ? <span className="muted"> {relativeToNow(row.scheduled_for)}</span>
+                        : null}
+                      <br />
+                      {preview}
+                      <br />
+                      <span className="muted">
+                        {account?.label ?? 'unknown account'} — {account?.platform ?? '?'}
+                        {row.published_at ? ` · published ${formatUtc(row.published_at)}` : null}
+                        {row.provider_post_ref ? ` · ${row.provider_post_ref}` : null}
+                        {row.attempts > 0 && row.status !== 'published'
+                          ? ` · ${row.attempts} attempt(s)` : null}
+                      </span>
+                      {/* A failure the operator cannot see is a post they think went
+                          out, so the provider's reason is shown rather than logged. */}
+                      {row.last_error && row.status !== 'published' ? (
+                        <>
+                          <br />
+                          <span className="muted">Last error: {row.last_error}</span>
+                        </>
+                      ) : null}
                     </span>
-                    {/* A failure the operator cannot see is a post they think went
-                        out, so the provider's reason is shown rather than logged. */}
-                    {row.last_error && row.status !== 'published' ? (
-                      <>
-                        <br />
-                        <span className="muted">Last error: {row.last_error}</span>
-                      </>
-                    ) : null}
-                  </span>
 
-                  {row.status === 'published' ? null : (
-                    <form action={cancelScheduledPostAction} className="inline">
-                      {csrf}
-                      <input type="hidden" name="scheduledId" value={row.id} />
-                      <button type="submit">Cancel</button>
-                    </form>
-                  )}
-                </li>
-              )
-            })}
-          </ul>
-        )}
-      </div>
+                    {row.status === 'scheduled' ? (
+                      <span className="actions">
+                        {/* Moving a post is an UPDATE of scheduled_for, which is the
+                            only column 0014 leaves a human on this table. */}
+                        <form action={reschedulePostAction} className="inline">
+                          {csrf}
+                          <input type="hidden" name="scheduledId" value={row.id} />
+                          <input type="datetime-local" name="scheduledFor" required
+                            defaultValue={toScheduleValue(row.scheduled_for)} />
+                          <button type="submit" className="secondary">Move</button>
+                        </form>
+                        <form action={cancelScheduledPostAction} className="inline">
+                          {csrf}
+                          <input type="hidden" name="scheduledId" value={row.id} />
+                          <button type="submit">Cancel</button>
+                        </form>
+                      </span>
+                    ) : row.status === 'published' ? null : (
+                      <form action={cancelScheduledPostAction} className="inline">
+                        {csrf}
+                        <input type="hidden" name="scheduledId" value={row.id} />
+                        <button type="submit">Cancel</button>
+                      </form>
+                    )}
+                  </li>
+                )
+              })}
+            </ul>
+          </div>
+        ))
+      )}
     </main>
   )
 }

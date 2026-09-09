@@ -49,3 +49,58 @@ export function defaultScheduleValue(now: Date = new Date()): string {
   const later = new Date(now.getTime() + 60 * 60 * 1000)
   return later.toISOString().slice(0, 16)
 }
+
+/** The value a datetime-local input needs in order to show an existing time. */
+export function toScheduleValue(value: string | Date | null): string {
+  if (!value) return ''
+  const date = typeof value === 'string' ? new Date(value) : value
+  if (Number.isNaN(date.getTime())) return ''
+  return date.toISOString().slice(0, 16)
+}
+
+/** Which UTC day an instant falls on, as the calendar groups them. */
+export function dayKeyUtc(value: string | Date | null): string {
+  if (!value) return ''
+  const date = typeof value === 'string' ? new Date(value) : value
+  if (Number.isNaN(date.getTime())) return ''
+  return date.toISOString().slice(0, 10)
+}
+
+const DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December']
+
+/**
+ * The heading the calendar puts above one day's posts.
+ *
+ * Written out by hand rather than through toLocaleDateString, for the same reason
+ * everything here is UTC: the server's locale and ICU build are not something the
+ * operator chose, and a heading that disagrees with the times beneath it is worse
+ * than a plain one.
+ */
+export function formatDayUtc(dayKey: string): string {
+  const date = new Date(`${dayKey}T00:00:00.000Z`)
+  if (Number.isNaN(date.getTime())) return dayKey
+  return `${DAYS[date.getUTCDay()]} ${date.getUTCDate()} ${MONTHS[date.getUTCMonth()]} ${date.getUTCFullYear()}`
+}
+
+/** "in 3 hours" / "2 days ago", for a glance at what is coming. */
+export function relativeToNow(value: string | Date | null, now: Date = new Date()): string {
+  if (!value) return '—'
+  const date = typeof value === 'string' ? new Date(value) : value
+  if (Number.isNaN(date.getTime())) return '—'
+
+  const minutes = Math.round((date.getTime() - now.getTime()) / 60_000)
+  const ago = minutes < 0
+  const size = Math.abs(minutes)
+
+  const [count, unit] =
+    size < 1 ? [0, 'minute'] :
+    size < 60 ? [size, 'minute'] :
+    size < 60 * 24 ? [Math.round(size / 60), 'hour'] :
+    [Math.round(size / (60 * 24)), 'day']
+
+  if (count === 0) return 'now'
+  const plural = count === 1 ? unit : `${unit}s`
+  return ago ? `${count} ${plural} ago` : `in ${count} ${plural}`
+}
