@@ -1590,6 +1590,28 @@ that guarded routes redirect before rendering and that the build is probed separ
 Both are small; both are the same failure this project keeps finding, which is a
 report describing something other than what happened.
 
+### G109 — One exchange is not one account
+
+Facebook and Instagram share a Meta app, share an OAuth exchange, and share a
+credential: the Page access token. So they shared a connector, and an Instagram
+connect wrote the **Page id** into `provider_account_ref`.
+
+Nothing failed. The connect succeeded, the row looked right, the token was correct,
+and the account it named could not be published to — an Instagram business account
+is addressed by its own id, which you can only learn by asking the Page which
+Instagram account it owns (`?fields=instagram_business_account`). The defect would
+have surfaced a phase later, as a publishing bug, with the wrong id already stored
+on every Instagram row anyone had connected.
+
+They are two connectors over one exchange now. The shared part is a function; the
+part that differs — which id identifies the account — is not shared, because it was
+never the same thing. A Page with no Instagram account attached is skipped rather
+than connected under a Page identity.
+
+The test asserts the negative as well as the positive (`not.toBe('page-1')`), and
+was checked by putting the bug back: it fails on exactly that line and nothing else.
+
+
 ## Known, accepted limitations
 
 Stated plainly rather than left to be discovered.
@@ -1620,12 +1642,14 @@ Stated plainly rather than left to be discovered.
    server-side caller could record an action that did not happen. Only `service_role`
    can reach it, so this is a compromised-server scenario, not a tenant one — but
    note `metadata.actor_source` will read `caller`, not `jwt`, for every such row.
-8. **Scan mode is a bypass, and bypasses are risk.** `lib/security/scan-mode.ts`
-   lets the local secret scanner render authenticated pages. It is inert unless
-   `SECRET_SCAN_TOKEN` is set, requires a matching header compared in constant time,
-   refuses to run unless `APP_ORIGIN` is a local address, and is deliberately absent
-   from `.env.example`. The scanner asserts all four fences. It is still a bypass,
-   and it is the single thing in this codebase most worth re-reading before deploy.
+8. **The scanner no longer renders authenticated pages.** `lib/security/scan-mode.ts`
+   was an auth bypass that let it do so, fenced four ways and still a bypass. It was
+   deleted: 120 lines of production auth surface so a scanner could read three static
+   headings was the worst trade in the repo for a one-person tool. The cost is real —
+   the canary grep now sees a guarded route's redirect rather than its rendered HTML.
+   What covers that gap instead is the render probe, which fails if a route touches
+   the data plane at all, and the build probe, which fails if the production build
+   does.
 9. **The secret scan renders against a stand-in for Supabase**, not the real thing.
    Every route is inspected and there is no exclusion list, but the rows are empty
    and the auth endpoint returns 401. It answers "do the server's own secrets reach

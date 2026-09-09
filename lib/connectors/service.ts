@@ -2,7 +2,7 @@ import 'server-only'
 
 import { createSupabaseAdminClient } from '@/lib/supabase/admin'
 import { appOrigin } from '@/lib/env'
-import { metaConnector } from '@/lib/connectors/meta'
+import { facebookConnector, instagramConnector } from '@/lib/connectors/meta'
 import type { Connector, DiscoveredAccount } from '@/lib/connectors/types'
 import type { SocialPlatform } from '@/lib/connectors/platforms'
 
@@ -18,10 +18,11 @@ import type { SocialPlatform } from '@/lib/connectors/platforms'
  */
 
 const CONNECTORS: Partial<Record<SocialPlatform, Connector>> = {
-  // Instagram business accounts are managed through the same Meta app and the same
-  // Page tokens, so they share a connector and differ only in the row's platform.
-  facebook: metaConnector,
-  instagram: metaConnector,
+  // Instagram business accounts are reached through the same Meta app and carry the
+  // same Page token, but they are addressed by their own id rather than the Page's,
+  // so they get their own connector over the shared exchange.
+  facebook: facebookConnector,
+  instagram: instagramConnector,
 }
 
 export function connectorFor(platform: SocialPlatform): Connector {

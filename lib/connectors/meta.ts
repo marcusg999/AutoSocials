@@ -4,7 +4,7 @@ import { metaAppCredentials } from '@/lib/env'
 import type { Connector, DiscoveredAccount } from '@/lib/connectors/types'
 
 /**
- * The Facebook / Instagram connector.
+ * The Facebook / Instagram connectors.
  *
  * Meta's flow is three exchanges, not one, and each step matters:
  *
@@ -16,6 +16,13 @@ import type { Connector, DiscoveredAccount } from '@/lib/connectors/types'
  * Page, so a leak costs one account rather than everything the person can reach,
  * and it is what publishing will actually need in a later phase. The user token is
  * used once, in this process, and never written anywhere.
+ *
+ * Facebook and Instagram share every one of those exchanges and share the same
+ * credential, but they are NOT the same account. A Facebook Page is published to as
+ * the Page id; an Instagram business account is published to as its own id, which
+ * you can only reach by asking the Page which Instagram account it owns. So they
+ * are two connectors over one exchange, and an Instagram row carries the Instagram
+ * id — not the Page id that produced its token.
  */
 
 const GRAPH = 'https://graph.facebook.com/v21.0'
@@ -48,74 +55,70 @@ async function graph(url: string): Promise<Record<string, unknown>> {
   return body
 }
 
-export const metaConnector: Connector = {
-  platform: 'facebook',
+/** Where to send the browser to begin consent. Identical for both platforms. */
+function authorizationUrl(state: string, redirectUri: string): string {
+  const { appId } = metaAppCredentials()
+  const url = new URL('https://www.facebook.com/v21.0/dialog/oauth')
+  url.searchParams.set('client_id', appId)
+  url.searchParams.set('redirect_uri', redirectUri)
+  url.searchParams.set('state', state)
+  url.searchParams.set('scope', SCOPES.join(','))
+  url.searchParams.set('response_type', 'code')
+  return url.toString()
+}
 
-  authorizationUrl(state: string, redirectUri: string): string {
-    const { appId } = metaAppCredentials()
-    const url = new URL('https://www.facebook.com/v21.0/dialog/oauth')
-    url.searchParams.set('client_id', appId)
-    url.searchParams.set('redirect_uri', redirectUri)
-    url.searchParams.set('state', state)
-    url.searchParams.set('scope', SCOPES.join(','))
-    url.searchParams.set('response_type', 'code')
-    return url.toString()
-  },
+/** One Page the user granted, with the token that acts on its behalf. */
+interface PageGrant {
+  id: string
+  name: string
+  token: string
+}
 
-  async exchange(code: string, redirectUri: string): Promise<DiscoveredAccount[]> {
-    const { appId, appSecret } = metaAppCredentials()
+/** The shared part of both exchanges: code in, Page tokens out. */
+async function exchangeForPages(code: string, redirectUri: string): Promise<{
+  pages: PageGrant[]
+  expiresAt: Date | null
+  scopes: string[]
+}> {
+  const { appId, appSecret } = metaAppCredentials()
 
-    const short = new URL(`${GRAPH}/oauth/access_token`)
-    short.searchParams.set('client_id', appId)
-    short.searchParams.set('client_secret', appSecret)
-    short.searchParams.set('redirect_uri', redirectUri)
-    short.searchParams.set('code', code)
-    const shortToken = String((await graph(short.toString())).access_token ?? '')
-    if (!shortToken) throw new Error('Meta returned no access token')
+  const short = new URL(`${GRAPH}/oauth/access_token`)
+  short.searchParams.set('client_id', appId)
+  short.searchParams.set('client_secret', appSecret)
+  short.searchParams.set('redirect_uri', redirectUri)
+  short.searchParams.set('code', code)
+  const shortToken = String((await graph(short.toString())).access_token ?? '')
+  if (!shortToken) throw new Error('Meta returned no access token')
 
-    const long = new URL(`${GRAPH}/oauth/access_token`)
-    long.searchParams.set('grant_type', 'fb_exchange_token')
-    long.searchParams.set('client_id', appId)
-    long.searchParams.set('client_secret', appSecret)
-    long.searchParams.set('fb_exchange_token', shortToken)
-    const longBody = await graph(long.toString())
-    const userToken = String(longBody.access_token ?? '')
-    if (!userToken) throw new Error('Meta returned no long-lived token')
+  const long = new URL(`${GRAPH}/oauth/access_token`)
+  long.searchParams.set('grant_type', 'fb_exchange_token')
+  long.searchParams.set('client_id', appId)
+  long.searchParams.set('client_secret', appSecret)
+  long.searchParams.set('fb_exchange_token', shortToken)
+  const longBody = await graph(long.toString())
+  const userToken = String(longBody.access_token ?? '')
+  if (!userToken) throw new Error('Meta returned no long-lived token')
 
-    // expires_in is seconds from now, and Meta omits it for tokens that do not
-    // expire. Absent means "no known expiry", not "expires immediately".
-    const expiresIn = Number(longBody.expires_in ?? 0)
-    const expiresAt = expiresIn > 0 ? new Date(Date.now() + expiresIn * 1000) : null
+  // expires_in is seconds from now, and Meta omits it for tokens that do not
+  // expire. Absent means "no known expiry", not "expires immediately".
+  const expiresIn = Number(longBody.expires_in ?? 0)
+  const expiresAt = expiresIn > 0 ? new Date(Date.now() + expiresIn * 1000) : null
 
-    const granted = await grantedScopes(userToken)
+  const scopes = await grantedScopes(userToken)
 
-    const pages = await graph(
-      `${GRAPH}/me/accounts?fields=id,name,access_token&access_token=${encodeURIComponent(userToken)}`)
-    const data = Array.isArray(pages.data) ? pages.data : []
+  const listing = await graph(
+    `${GRAPH}/me/accounts?fields=id,name,access_token&access_token=${encodeURIComponent(userToken)}`)
+  const data = Array.isArray(listing.data) ? listing.data : []
 
-    return data.flatMap((raw): DiscoveredAccount[] => {
-      const page = raw as { id?: string; name?: string; access_token?: string }
-      if (!page.id || !page.access_token) return []
-      return [{
-        providerAccountRef: page.id,
-        label: page.name ?? page.id,
-        credential: page.access_token,
-        expiresAt,
-        scopes: granted,
-      }]
-    })
-  },
+  const pages = data.flatMap((raw): PageGrant[] => {
+    const page = raw as { id?: string; name?: string; access_token?: string }
+    // A Page without a token is one we cannot act for, so it is not an account we
+    // can offer to connect. Skipping is right; failing the whole connect is not.
+    if (!page.id || !page.access_token) return []
+    return [{ id: page.id, name: page.name ?? page.id, token: page.access_token }]
+  })
 
-  async revoke(credential: string, providerAccountRef: string): Promise<void> {
-    // DELETE /{id}/permissions revokes the app's access for that account. Best
-    // effort by contract: the caller clears local state either way, because a
-    // token we can no longer revoke is the one we most want to stop storing.
-    await fetch(
-      `${GRAPH}/${encodeURIComponent(providerAccountRef)}/permissions`
-        + `?access_token=${encodeURIComponent(credential)}`,
-      { method: 'DELETE', cache: 'no-store' },
-    )
-  },
+  return { pages, expiresAt, scopes }
 }
 
 /** What the user actually granted, which is not necessarily what was requested. */
@@ -127,4 +130,79 @@ async function grantedScopes(userToken: string): Promise<string[]> {
     .map((raw) => raw as { permission?: string; status?: string })
     .filter((entry) => entry.status === 'granted' && entry.permission)
     .map((entry) => entry.permission!)
+}
+
+export const facebookConnector: Connector = {
+  platform: 'facebook',
+
+  authorizationUrl,
+
+  async exchange(code: string, redirectUri: string): Promise<DiscoveredAccount[]> {
+    const { pages, expiresAt, scopes } = await exchangeForPages(code, redirectUri)
+    return pages.map((page) => ({
+      providerAccountRef: page.id,
+      label: page.name,
+      credential: page.token,
+      expiresAt,
+      scopes,
+    }))
+  },
+
+  async revoke(credential: string, providerAccountRef: string): Promise<void> {
+    // Best effort by contract: the caller clears local state either way, because a
+    // token we can no longer revoke is the one we most want to stop storing. This
+    // request has never been run against a real Meta app — see BUILD_NOTES.
+    await fetch(
+      `${GRAPH}/${encodeURIComponent(providerAccountRef)}/permissions`
+        + `?access_token=${encodeURIComponent(credential)}`,
+      { method: 'DELETE', cache: 'no-store' },
+    )
+  },
+}
+
+export const instagramConnector: Connector = {
+  platform: 'instagram',
+
+  authorizationUrl,
+
+  async exchange(code: string, redirectUri: string): Promise<DiscoveredAccount[]> {
+    const { pages, expiresAt, scopes } = await exchangeForPages(code, redirectUri)
+
+    const discovered: DiscoveredAccount[] = []
+    for (const page of pages) {
+      // Instagram business accounts hang off a Page, so this is one lookup per
+      // Page. A Page with no Instagram account attached is simply not an Instagram
+      // account to connect, and is skipped rather than connected under the wrong id.
+      const body = await graph(
+        `${GRAPH}/${encodeURIComponent(page.id)}`
+          + '?fields=instagram_business_account{id,username}'
+          + `&access_token=${encodeURIComponent(page.token)}`)
+      const account = body.instagram_business_account as
+        { id?: string; username?: string } | undefined
+      if (!account?.id) continue
+
+      discovered.push({
+        // The Instagram id, not the Page id. Publishing addresses the Instagram
+        // account by this id; the Page token is only what authorises the call.
+        providerAccountRef: account.id,
+        label: account.username ? `@${account.username}` : page.name,
+        credential: page.token,
+        expiresAt,
+        scopes,
+      })
+    }
+    return discovered
+  },
+
+  async revoke(credential: string): Promise<void> {
+    // Deliberately not `/{instagram-id}/permissions`: permissions belong to the node
+    // the token acts as, and this token acts as the Page. With a Page token `/me` IS
+    // that Page, so this is the same request the Facebook connector makes, without
+    // needing to have stored the Page id alongside the Instagram one. Best effort,
+    // and likewise unverified against a real Meta app — see BUILD_NOTES.
+    await fetch(
+      `${GRAPH}/me/permissions?access_token=${encodeURIComponent(credential)}`,
+      { method: 'DELETE', cache: 'no-store' },
+    )
+  },
 }

@@ -217,8 +217,6 @@ const NOT_CANARYABLE: Record<string, string> = {
   APP_ORIGIN: 'an origin the app must match against real requests',
   // Parsed as a number.
   TRUSTED_PROXY_COUNT: 'a small integer, not a credential',
-  // Set per run by the scanner itself and asserted absent from .env.example.
-  SECRET_SCAN_TOKEN: 'generated per run; checked separately by checkScanModeIsNotShipped',
   // The same project URL that ships publicly as NEXT_PUBLIC_SUPABASE_URL. Canarying
   // it would flag every legitimate appearance of the public value.
   SUPABASE_URL: 'the public project URL, also shipped as NEXT_PUBLIC_SUPABASE_URL',
@@ -252,8 +250,7 @@ function assertCanariesCoverEveryServerVar() {
 const PORT = 3987
 const ORIGIN = `http://127.0.0.1:${PORT}`
 
-// Lets the scanner render authenticated pages. Generated fresh for each run and
-// never written anywhere. See lib/security/scan-mode.ts for the fences.
+/** Where the Supabase stand-in listens while the app under test is served. */
 const STUB_PORT = 3988
 
 /** Probe logs live outside .next, which this script deletes before each build. */

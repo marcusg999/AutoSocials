@@ -111,7 +111,12 @@ happens, and why each step is there:
 4. The exchange is three steps: code → short-lived user token → long-lived user token
    → **per-Page tokens**. Only the Page tokens are stored. A Page token is scoped to
    one account, so a leak costs one account rather than everything you can reach.
-5. Each token goes straight into Supabase Vault under a name derived from the account
+5. **Connecting Instagram asks each Page which Instagram account it owns**, and stores
+   *that* id. Instagram shares the Meta app, the exchange and the Page token, but an
+   Instagram business account is addressed by its own id — storing the Page id would
+   connect cleanly and point at an account nothing can publish to. A Page with no
+   Instagram account attached is skipped rather than connected.
+6. Each token goes straight into Supabase Vault under a name derived from the account
    id. `social_accounts` stores only the non-secret reference; reading a credential
    back needs the account id, so the stored reference is not a lookup key.
 
