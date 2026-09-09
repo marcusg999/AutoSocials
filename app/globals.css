@@ -62,6 +62,9 @@ label {
 input[type="text"],
 input[type="email"],
 input[type="password"],
+input[type="url"],
+input[type="datetime-local"],
+textarea,
 select {
   width: 100%;
   padding: 9px 11px;
@@ -79,6 +82,29 @@ input:focus, select:focus, button:focus {
 }
 
 .field { margin-bottom: 16px; }
+
+/* Composer. A textarea inherits the input rules above; these are the parts an
+   input has no opinion about. */
+textarea { resize: vertical; line-height: 1.45; }
+
+fieldset {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 12px 14px;
+  margin: 16px 0;
+}
+legend { font-size: 13px; font-weight: 600; padding: 0 6px; }
+
+/* A checkbox and its text on one line, rather than the block layout `label`
+   otherwise gets. */
+label.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 400;
+  margin-bottom: 6px;
+}
+label.check input { width: auto; }
 
 .code-input {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;

@@ -1612,6 +1612,132 @@ The test asserts the negative as well as the positive (`not.toBe('page-1')`), an
 was checked by putting the bug back: it fails on exactly that line and nothing else.
 
 
+## Gotchas found while building the scheduler (Phase 3)
+
+### G110 — The one failure that cannot be undone is publishing twice
+
+Everything else in this app is recoverable. A post that goes out twice is not: it is
+visible to other people before anybody notices, and deleting it does not un-send it.
+So the claim is not an application flag.
+
+Two workers reading `where status = 'scheduled' and scheduled_for <= now()` will both
+read the same row, and both publish it. `SELECT ... FOR UPDATE SKIP LOCKED` inside a CTE
+that feeds the `UPDATE` fixes that: the second worker skips what the first has locked,
+and the update is the same statement as the read, so there is no window between them.
+
+But a database lock covers only a worker that is *alive*. A worker that dies mid-publish
+releases its lock the moment its connection drops, and the row becomes claimable again —
+possibly after the post has already gone out. That is why the row also carries
+`locked_until`: a lease outlives the connection. The lock stops two workers colliding in
+the same instant; the lease stops the next run picking up something a dead worker may
+already have published. Neither one alone is enough, which is why both are there.
+
+`attempts` increments at claim time, not at completion. A worker that dies leaves no
+completion behind, so counting on completion would let a row that crashes the worker
+retry until the end of time.
+
+The test that matters here does not read the SQL. It opens two connections, begins two
+transactions, calls the function in both, and asserts the intersection of the two result
+sets is empty.
+
+### G111 — `ALTER TYPE ... ADD VALUE` cannot run in a transaction
+
+The obvious modelling was a new `post_status` value — `publishing`, say — to mark a row
+in flight. `scripts/migrate.ts` wraps each migration in a single transaction, which is
+the right thing for a migration runner to do and is why the whole file rolls back if any
+statement fails. Postgres will not add an enum value inside one.
+
+The choice was between weakening the migration runner for every future migration and
+carrying the extra state in columns. Columns won, and turned out to be the better model
+anyway: `locked_until` and `locked_by` say *who* holds a row and *until when*, which a
+status value cannot express, and a lease that expires needs no state transition to
+become claimable again.
+
+### G112 — `scheduled_posts` still had a table-wide UPDATE grant
+
+Every other table in this schema had its UPDATE grant narrowed to the columns a human
+has any business writing — `posts.created_by`, `social_accounts.encrypted_credential_ref`.
+`scheduled_posts` was left with `grant update` on the whole row in `0006`, and it was
+harmless, because at that point every column on it was one the owner was allowed to set.
+
+Phase 3 added `published_at`, `provider_post_ref`, `status` transitions to `published`,
+and `attempts`. The instant those columns existed, that old grant meant a signed-in
+owner could mark a post as published that never went out, and clear the error explaining
+why it hadn't. Not a tenancy hole — RLS still confines them to their own rows — but the
+row stops being a record of what happened and becomes a record of what somebody typed.
+
+Now: `grant update (scheduled_for)`. A human can move a post in time, or delete it to
+call it off. Declaring it published is the worker's job, through a `SECURITY DEFINER`
+function `authenticated` cannot call. Each refusal has its own test, because a single
+test that "an update fails" would pass for the wrong reason.
+
+### G113 — A second refusal in the same transaction proves nothing
+
+Two `expectRejected` calls in one `asUser` block. The second one passed — reporting
+`current transaction is aborted, commands ignored until end of transaction block`.
+
+Postgres had refused it because the *first* statement had already failed, not because of
+the grant the test was written to prove. Remove the grant entirely and the test still
+goes green. It is the project's recurring failure in a new costume: a green result that
+measures something other than the thing named in the test.
+
+One refusal per test now, with a comment saying why they cannot be combined.
+
+### G114 — `audit_log` is append-only against me, too
+
+A test wanted a clean slate, so it opened with `delete from public.audit_log` as the
+admin client — and got `audit_log is append-only: DELETE is not permitted`.
+
+That is G104's control, working exactly as designed, on the person who wrote it. It was
+briefly tempting to reach for a way around it. The test was rewritten instead: it counts
+rows for one specific scheduled post and asserts the exact sequence of actions and the
+`changed_columns` on each. A stronger assertion than the one it replaced, arrived at by
+being refused.
+
+Worth recording for the same reason: the publishing functions write **no audit rows of
+their own**. The `audit_changes` row trigger from `0007` already covers `scheduled_posts`,
+so a function that also wrote its own row would produce two records of one event that
+could later disagree.
+
+### G115 — `datetime-local` has no timezone
+
+The browser sends `2026-09-09T14:30`. Not UTC, not local — no zone at all. Hand that to
+`new Date()` and it is read in the *server's* zone, so the same form submitted against
+Netlify and against a laptop schedules two different moments.
+
+Parsed explicitly as UTC via `Date.UTC` now, with everything displayed as UTC and
+labelled UTC on both the form and the calendar. A scheduler that is subtly wrong about
+time is worse than one that makes you do the arithmetic yourself.
+
+The second half of that: `Date.UTC(2026, 1, 31)` does not fail, it returns 3 March.
+Silently moving somebody's post by three days is worse than refusing the form, so the
+parser round-trips the parsed date back to its components and rejects anything that
+moved.
+
+### G116 — A provider error can contain the credential
+
+`last_error` is written into a row the operator reads, by a function whose changes land
+in an append-only audit table. Meta's error text is not ours, and an auth failure is
+exactly the kind of error that quotes back the token it rejected.
+
+The publisher redacts the credential out of any message before it is recorded. The guard
+on that guard: a credential under 8 characters is ignored, because a stub or near-empty
+value would otherwise redact every message into noise.
+
+### G117 — Instagram publishes in two steps, and only the second one is real
+
+`POST /{ig}/media` creates a container; `POST /{ig}/media_publish` makes it visible.
+Failing at the first step must leave nothing behind and must not have called the second,
+or a retry follows a post that already went out. The connector does nothing after
+`media_publish` returns — no logging, no parsing that could throw — because a throw
+after the post is live turns one published post into two on the next attempt.
+
+The test stub routes publish responses **longest key first**, or `/media_publish` gets
+answered by the `/media` rule and the two-step test asserts against itself.
+
+Also: the token travels in the POST **body**, not the query string, so it does not land
+in anybody's access logs.
+
 ## Known, accepted limitations
 
 Stated plainly rather than left to be discovered.
@@ -1664,3 +1790,22 @@ Stated plainly rather than left to be discovered.
 12. **`TRUSTED_PROXY_COUNT` must match the deployment.** The audit IP is read that
    many entries from the end of `X-Forwarded-For`. Set it wrong and the recorded
    address is wrong — silently.
+13. **Publishing has never run against the live Graph API.** The call shapes, the
+   two-step Instagram flow and the failure paths are tested against a stub. The
+   round trip to Meta is unproven, and is the largest untested surface in Phase 3.
+14. **Images are given as a public https URL; there is no upload.** Meta fetches the
+   address itself, so anything not reachable from the internet fails at publish time.
+   The composer refuses `http`, `localhost`, loopback and `.local` up front, but it
+   cannot tell whether a public-looking address actually resolves.
+15. **Everything is UTC. There is no per-user timezone.** Deliberate for one operator,
+   and wrong the moment somebody else schedules a post.
+16. **A post that fails five times stops on its own and stays failed.** There is no
+   automatic retry past that and no notification — the calendar shows the status and
+   the provider's last error, and the operator has to look.
+17. **The worker is a single pass, run by an external scheduler.** `npm run publish:due`
+   claims what is due, publishes it, and exits. Nothing runs it on a timer inside this
+   repo; that is Railway's job. If nothing invokes it, nothing is ever published.
+18. **The lease is five minutes.** A publish that hangs longer than that can be claimed
+   again by the next run while the first is still in flight. Longer leases delay
+   recovery from a dead worker; shorter ones risk exactly this. Five minutes is a
+   judgement about Meta's response times, not a proof.

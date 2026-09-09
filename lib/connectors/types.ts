@@ -1,10 +1,9 @@
 /**
  * What every platform connector must provide.
  *
- * Phase 2 is the connector layer only: connecting an account, storing its
- * credential, and disconnecting. Publishing belongs to the scheduler phase and is
- * deliberately absent — Phase 1's brief said not to build ahead, and that held up
- * well enough to repeat.
+ * Phase 2 built connecting, storing a credential and disconnecting. Phase 3 adds
+ * exactly one thing to this interface — publish — because that is what a scheduler
+ * needs and nothing more.
  *
  * The shape exists so a second platform is one file rather than a second copy of
  * the OAuth plumbing. The credential never appears in this interface's return
@@ -12,6 +11,7 @@
  * and is referenced afterwards only by account id.
  */
 import type { SocialPlatform } from '@/lib/connectors/platforms'
+import type { PostContent } from '@/lib/connectors/content'
 
 /** One account the provider says we may manage, before the user picks any. */
 export interface DiscoveredAccount {
@@ -47,4 +47,22 @@ export interface Connector {
    * to stop storing.
    */
   revoke(credential: string, providerAccountRef: string): Promise<void>
+
+  /**
+   * Publish once, and return the platform's own id for what was created.
+   *
+   * Throws on any failure. The caller treats a throw as "this attempt failed" and
+   * will retry, so an implementation must not throw after the post is actually
+   * live — that turns one published post into two. Where a platform needs several
+   * calls, the LAST one is the one that publishes, and anything after it must not
+   * be able to fail the attempt.
+   *
+   * The returned reference is stored so the operator can go and find the post. It
+   * is not used to address the post again; nothing here edits or deletes.
+   */
+  publish(
+    credential: string,
+    providerAccountRef: string,
+    content: PostContent,
+  ): Promise<string>
 }

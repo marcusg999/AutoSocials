@@ -1,6 +1,7 @@
 import 'server-only'
 
 import { metaAppCredentials } from '@/lib/env'
+import { contentProblemFor, type PostContent } from '@/lib/connectors/content'
 import type { Connector, DiscoveredAccount } from '@/lib/connectors/types'
 
 /**
@@ -50,6 +51,31 @@ async function graph(url: string): Promise<Record<string, unknown>> {
   if (!response.ok || error) {
     // The message is shown to the operator and written to the audit log, so it must
     // not carry the token. Meta echoes request parameters in some error bodies.
+    throw new Error(`Meta rejected the request: ${error?.message ?? response.status}`)
+  }
+  return body
+}
+
+/**
+ * The same, for calls that change something.
+ *
+ * Parameters go in the BODY rather than the query string. Meta accepts either, and
+ * the query string is the version that ends up in access logs and error reports —
+ * which for these calls would mean the Page token, on every publish.
+ */
+async function graphPost(
+  path: string,
+  params: Record<string, string>,
+): Promise<Record<string, unknown>> {
+  const response = await fetch(`${GRAPH}${path}`, {
+    method: 'POST',
+    cache: 'no-store',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams(params).toString(),
+  })
+  const body = (await response.json()) as Record<string, unknown>
+  const error = body.error as { message?: string } | undefined
+  if (!response.ok || error) {
     throw new Error(`Meta rejected the request: ${error?.message ?? response.status}`)
   }
   return body
@@ -158,6 +184,38 @@ export const facebookConnector: Connector = {
       { method: 'DELETE', cache: 'no-store' },
     )
   },
+
+  /**
+   * One call, which is why Facebook is the easy half.
+   *
+   * A post with an image goes to /photos and a post without one goes to /feed;
+   * they are different edges rather than one edge with an optional field.
+   */
+  async publish(
+    credential: string,
+    providerAccountRef: string,
+    content: PostContent,
+  ): Promise<string> {
+    assertPublishable('facebook', content)
+    const page = encodeURIComponent(providerAccountRef)
+
+    if (content.imageUrl) {
+      const body = await graphPost(`/${page}/photos`, {
+        url: content.imageUrl,
+        caption: content.text,
+        access_token: credential,
+      })
+      // /photos returns the photo id AND the id of the post it created. The post is
+      // the thing a human wants to open, so prefer it.
+      return String(body.post_id ?? body.id ?? '')
+    }
+
+    const body = await graphPost(`/${page}/feed`, {
+      message: content.text,
+      access_token: credential,
+    })
+    return String(body.id ?? '')
+  },
 }
 
 export const instagramConnector: Connector = {
@@ -205,4 +263,53 @@ export const instagramConnector: Connector = {
       { method: 'DELETE', cache: 'no-store' },
     )
   },
+
+  /**
+   * Two calls: build a container, then publish it.
+   *
+   * The order is the whole safety property. Creating a container publishes
+   * nothing, so a failure there is free and the attempt can be retried. Only
+   * media_publish makes the post visible, and it is the LAST thing that happens —
+   * nothing after it can throw, so a retry can never follow a post that already
+   * went out. A container that is created and never published simply expires at
+   * Meta after 24 hours.
+   */
+  async publish(
+    credential: string,
+    providerAccountRef: string,
+    content: PostContent,
+  ): Promise<string> {
+    assertPublishable('instagram', content)
+    const account = encodeURIComponent(providerAccountRef)
+
+    // Checked by assertPublishable above; narrowing it here for the type.
+    const imageUrl = content.imageUrl!
+
+    const container = await graphPost(`/${account}/media`, {
+      image_url: imageUrl,
+      caption: content.text,
+      access_token: credential,
+    })
+    const creationId = String(container.id ?? '')
+    if (!creationId) throw new Error('Meta created no media container')
+
+    const published = await graphPost(`/${account}/media_publish`, {
+      creation_id: creationId,
+      access_token: credential,
+    })
+    return String(published.id ?? '')
+  },
+}
+
+/**
+ * The last fence, not the first.
+ *
+ * The composer refuses this content and the scheduling action refuses it again;
+ * this catches the case where a post was scheduled and then edited into something
+ * its platform cannot take. Throwing here costs one failed attempt and a message
+ * the operator can read on the calendar.
+ */
+function assertPublishable(platform: 'facebook' | 'instagram', content: PostContent): void {
+  const problem = contentProblemFor(platform, content)
+  if (problem) throw new Error(problem)
 }

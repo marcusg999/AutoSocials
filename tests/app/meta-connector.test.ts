@@ -67,11 +67,36 @@ function respond(url: string): Record<string, unknown> {
   throw new Error(`unrouted Graph request: ${url}`)
 }
 
+/** Every POST the connectors made, so the ORDER of the Instagram calls is testable. */
+interface Sent { url: string; method: string; params: URLSearchParams }
+let sent: Sent[] = []
+
+/** Publish responses, keyed by the path fragment that identifies the edge. */
+let publishResponses: Record<string, () => Record<string, unknown>> = {}
+
 beforeEach(() => {
   requested = []
-  vi.stubGlobal('fetch', async (input: unknown) => {
+  sent = []
+  publishResponses = {
+    '/feed': () => ({ id: 'page-1_111' }),
+    '/photos': () => ({ id: 'photo-1', post_id: 'page-1_222' }),
+    '/media': () => ({ id: 'container-1' }),
+    '/media_publish': () => ({ id: 'ig-media-1' }),
+  }
+  vi.stubGlobal('fetch', async (input: unknown, init?: RequestInit) => {
     const url = String(input)
     requested.push(url)
+    const method = init?.method ?? 'GET'
+    if (method === 'POST') {
+      const params = new URLSearchParams(String(init?.body ?? ''))
+      sent.push({ url, method, params })
+      // Longest match first, so '/media_publish' is not answered by '/media'.
+      const edge = Object.keys(publishResponses)
+        .sort((a, b) => b.length - a.length)
+        .find((key) => url.includes(key))
+      if (!edge) throw new Error(`unrouted POST: ${url}`)
+      return { ok: true, json: async () => publishResponses[edge]!() } as unknown as Response
+    }
     return { ok: true, json: async () => respond(url) } as unknown as Response
   })
 })
@@ -131,5 +156,96 @@ describe('both connectors', () => {
     const leaked = requested.filter(
       (url) => url.includes('test-app-secret') && !url.includes('/oauth/access_token'))
     expect(leaked).toEqual([])
+  })
+})
+
+describe('publishing to Facebook', () => {
+  test('a text post goes to /feed and returns the post id', async () => {
+    const ref = await facebookConnector.publish(PAGE_ONE_TOKEN, 'page-1', {
+      text: 'hello world', imageUrl: null,
+    })
+
+    expect(ref).toBe('page-1_111')
+    expect(sent).toHaveLength(1)
+    expect(sent[0]!.url).toContain('/page-1/feed')
+    expect(sent[0]!.params.get('message')).toBe('hello world')
+  })
+
+  test('a post with an image goes to /photos, which is a different edge', async () => {
+    const ref = await facebookConnector.publish(PAGE_ONE_TOKEN, 'page-1', {
+      text: 'caption here', imageUrl: 'https://cdn.example.com/a.jpg',
+    })
+
+    expect(sent[0]!.url).toContain('/page-1/photos')
+    expect(sent[0]!.params.get('url')).toBe('https://cdn.example.com/a.jpg')
+    expect(sent[0]!.params.get('caption')).toBe('caption here')
+    // /photos returns both a photo id and the id of the post it created. The post
+    // is what a human wants to open.
+    expect(ref).toBe('page-1_222')
+  })
+
+  test('the token travels in the body, never in the query string', async () => {
+    await facebookConnector.publish(PAGE_ONE_TOKEN, 'page-1', { text: 'hi', imageUrl: null })
+
+    expect(sent[0]!.url).not.toContain(PAGE_ONE_TOKEN)
+    expect(sent[0]!.params.get('access_token')).toBe(PAGE_ONE_TOKEN)
+  })
+
+  test('a provider error becomes a throw, so the attempt is recorded as failed', async () => {
+    publishResponses['/feed'] = () => ({ error: { message: 'Page is restricted' } })
+    await expect(
+      facebookConnector.publish(PAGE_ONE_TOKEN, 'page-1', { text: 'hi', imageUrl: null }),
+    ).rejects.toThrow(/Page is restricted/)
+  })
+})
+
+describe('publishing to Instagram', () => {
+  const IMAGE = { text: 'a caption', imageUrl: 'https://cdn.example.com/a.jpg' }
+
+  test('creates a container, then publishes it, in that order', async () => {
+    const ref = await instagramConnector.publish(PAGE_ONE_TOKEN, 'ig-account-1', IMAGE)
+
+    expect(sent.map((s) => s.url.split('/').pop())).toEqual(['media', 'media_publish'])
+    expect(sent[0]!.params.get('image_url')).toBe('https://cdn.example.com/a.jpg')
+    expect(sent[0]!.params.get('caption')).toBe('a caption')
+    expect(sent[1]!.params.get('creation_id')).toBe('container-1')
+    expect(ref).toBe('ig-media-1')
+  })
+
+  /**
+   * The safety property of the two-step. Creating a container publishes nothing,
+   * so failing there must leave nothing visible and must not have called publish —
+   * otherwise a retry could follow a post that already went out.
+   */
+  test('a failed container never reaches media_publish', async () => {
+    publishResponses['/media'] = () => ({ error: { message: 'image could not be fetched' } })
+
+    await expect(instagramConnector.publish(PAGE_ONE_TOKEN, 'ig-account-1', IMAGE))
+      .rejects.toThrow(/image could not be fetched/)
+
+    expect(sent.map((s) => s.url)).toHaveLength(1)
+    expect(sent[0]!.url).toContain('/media')
+    expect(sent.some((s) => s.url.includes('media_publish'))).toBe(false)
+  })
+
+  test('a container with no id is an error rather than a publish of nothing', async () => {
+    publishResponses['/media'] = () => ({})
+    await expect(instagramConnector.publish(PAGE_ONE_TOKEN, 'ig-account-1', IMAGE))
+      .rejects.toThrow(/no media container/i)
+  })
+
+  test('refuses a text-only post before making any call at all', async () => {
+    await expect(
+      instagramConnector.publish(PAGE_ONE_TOKEN, 'ig-account-1', { text: 'hi', imageUrl: null }),
+    ).rejects.toThrow(/cannot publish text on its own/i)
+    expect(sent).toHaveLength(0)
+  })
+
+  test('publishes as the Instagram id, not the Page id', async () => {
+    await instagramConnector.publish(PAGE_ONE_TOKEN, 'ig-account-1', IMAGE)
+    for (const call of sent) {
+      expect(call.url).toContain('ig-account-1')
+      expect(call.url).not.toContain('/page-1/')
+    }
   })
 })

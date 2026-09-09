@@ -124,7 +124,46 @@ happens, and why each step is there:
 in that order, and the local half happens even if revocation fails, because a token
 you can no longer revoke is the one you most want to stop storing.
 
-Publishing is deliberately not built. That is the scheduler phase.
+## Scheduling and publishing (Phase 3)
+
+Write a post on **/dashboard/composer**, tick the accounts it should go to, pick a time,
+and it appears on **/dashboard/calendar**. One post, one row per account, so a failure on
+Instagram does not hide a success on Facebook.
+
+**All times are UTC**, on the form and on the calendar, and every displayed time says so.
+A `datetime-local` field carries no timezone at all, so reading it as anything else means
+the same form submitted from two machines schedules two different moments.
+
+Nothing is published by the web app. A worker does it:
+
+```bash
+npm run publish:due
+```
+
+That claims everything due, publishes it, prints a one-line summary, and exits. It is the
+Railway entry point — run it on a schedule (every minute or two is sensible). It needs
+`SUPABASE_SERVICE_ROLE_KEY`, because claiming and completing are `SECURITY DEFINER`
+functions that only `service_role` can call. A post that fails is not a failed run: the
+run reports it and moves on.
+
+The claim is the part worth understanding, because publishing has exactly one failure that
+cannot be undone — a post going out twice:
+
+1. `app.claim_due_scheduled_posts` selects what is due `FOR UPDATE SKIP LOCKED` and marks
+   it in the same statement, so two workers running at the same instant cannot take the
+   same row.
+2. It also writes a **lease** (`locked_until`, five minutes). A worker that dies releases
+   its database lock immediately, but not its lease, so the next run leaves alone a row
+   that may already have been published.
+3. `attempts` increments when the row is claimed, not when it completes — otherwise a post
+   that crashes the worker would retry forever.
+4. `app.complete_scheduled_post` records the outcome. A success is terminal. A failure
+   backs off (1, 3, 9, 27 minutes) and gives up after five attempts, leaving the provider's
+   reason in `last_error` for the calendar to show.
+
+Neither function can be called by a signed-in user. Their UPDATE grant on `scheduled_posts`
+is narrowed to `scheduled_for` alone: you can move a post or cancel it, but declaring one
+published is the worker's job.
 
 ## What you will see
 
@@ -134,8 +173,8 @@ Publishing is deliberately not built. That is the scheduler phase.
 | `/mfa/enroll` | TOTP enrolment. Shown until a verified factor exists. |
 | `/mfa/verify` | TOTP challenge on later sign-ins. |
 | `/dashboard` | Lists the businesses you are a member of, with an active-business switcher. |
-| `/dashboard/composer` | Placeholder. Proves its own session, renders nothing. |
-| `/dashboard/calendar` | Placeholder. |
+| `/dashboard/composer` | Write a post and schedule it to connected accounts. |
+| `/dashboard/calendar` | Everything scheduled, its status, and the provider's last error. |
 | `/dashboard/accounts` | Connect and disconnect social accounts. |
 | `/api/connectors/[platform]/callback` | Where Meta returns the authorization code. Guarded: MFA session required. |
 
