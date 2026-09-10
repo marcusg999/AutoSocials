@@ -9,6 +9,7 @@ import { recordAuditOrThrow } from '@/lib/audit'
 import { UUID_PATTERN } from '@/lib/business'
 import { contentProblemFor, MAX_POST_TEXT, type PostContent } from '@/lib/connectors/content'
 import { parseScheduledFor } from '@/lib/publishing/schedule-time'
+import { describeAssistantError, suggestPosts } from '@/lib/assistant/claude'
 import type { SocialPlatform } from '@/lib/connectors/platforms'
 
 /** The two fields the composer collects, read the same way by every action here. */
@@ -26,6 +27,120 @@ function readUuid(formData: FormData, field: string, what: string): string {
   const value = String(formData.get(field) ?? '')
   if (!UUID_PATTERN.test(value)) throw new Error(`Invalid ${what}`)
   return value
+}
+
+/**
+ * Ask the assistant for alternatives to what is in the composer.
+ *
+ * The suggestions are written to a table and the browser is redirected back to
+ * the composer to read them, rather than returned from this action. Two reasons:
+ * an action's return value travels in the flight payload, which the secret scan
+ * structurally cannot read, and a suggestion is worth keeping — it cost money, it
+ * came from the operator's own draft, and the audit trail should be able to say
+ * what was proposed.
+ *
+ * Nothing here publishes anything. The assistant's entire output is text in a
+ * form that a human still has to submit.
+ */
+export async function suggestPostAction(formData: FormData): Promise<void> {
+  await assertCsrf(formData)
+  const { supabase, userId } = await requireMfaSessionOrThrow()
+
+  const businessId = readUuid(formData, 'businessId', 'business id')
+  const content = readContent(formData)
+  const instruction = String(formData.get('instruction') ?? '')
+
+  if (content.text.trim() === '' && instruction.trim() === '') {
+    throw new Error('Write something first, or tell the assistant what you want')
+  }
+
+  const postId = String(formData.get('postId') ?? '')
+  if (postId !== '' && !UUID_PATTERN.test(postId)) throw new Error('Invalid post id')
+
+  // Which platforms this is going to, read through RLS so it is the caller's own
+  // accounts deciding the advice, never an id from the form.
+  const chosenIds = formData.getAll('accountIds').map(String).filter((id) => UUID_PATTERN.test(id))
+  const { data: accounts } = await supabase
+    .from('social_accounts')
+    .select('id, business_id, platform')
+    .eq('business_id', businessId)
+    .eq('status', 'connected')
+  const relevant = (accounts ?? []).filter(
+    (account) => chosenIds.length === 0 || chosenIds.includes(account.id))
+  const platforms = [...new Set(relevant.map((a) => a.platform))] as SocialPlatform[]
+
+  // Audited before the call, not after: a request that costs money and leaves the
+  // building should be recorded even if it then fails.
+  await recordAuditOrThrow({
+    action: 'assistant.suggestions.requested',
+    businessId,
+    targetType: 'post',
+    targetId: postId === '' ? null : postId,
+    // Shape, never content: audit_log can never be pruned, and there is no reason
+    // for it to hold a second copy of every draft ever written.
+    metadata: {
+      platforms,
+      characters: content.text.length,
+      has_instruction: instruction.trim() !== '',
+    },
+    actorUserId: userId,
+  })
+
+  let suggestions
+  try {
+    suggestions = await suggestPosts(content, platforms, instruction)
+  } catch (error) {
+    // describeAssistantError keeps the API key out of the message, the same rule
+    // the publisher follows for last_error.
+    throw new Error(describeAssistantError(error))
+  }
+
+  const { error } = await supabase.from('post_suggestions').insert(
+    suggestions.map((suggestion) => ({
+      business_id: businessId,
+      post_id: postId === '' ? null : postId,
+      // The insert policy requires this to be the caller.
+      created_by: userId,
+      suggestion: suggestion.text,
+      model: suggestion.model,
+    })))
+  if (error) throw new Error(`Could not save the suggestions: ${error.message}`)
+
+  revalidatePath('/dashboard/composer')
+  redirect(postId === ''
+    ? '/dashboard/composer?suggested=1'
+    : `/dashboard/composer?draft=${postId}&suggested=1`)
+}
+
+/**
+ * Clear the suggestions on screen.
+ *
+ * A DELETE, because a suggestion is a record of what the model said and there is
+ * no UPDATE grant on that table at all — editing one in place would make the
+ * model's words indistinguishable from the operator's.
+ */
+export async function discardSuggestionsAction(formData: FormData): Promise<void> {
+  await assertCsrf(formData)
+  const { supabase, userId } = await requireMfaSessionOrThrow()
+
+  const businessId = readUuid(formData, 'businessId', 'business id')
+
+  await recordAuditOrThrow({
+    action: 'assistant.suggestions.discarded',
+    businessId,
+    targetType: 'business',
+    targetId: businessId,
+    actorUserId: userId,
+  })
+
+  // RLS confines this to the caller's own business; the filter picks which of
+  // their businesses is being cleared.
+  const { error } = await supabase
+    .from('post_suggestions').delete().eq('business_id', businessId)
+  if (error) throw new Error(`Could not clear them: ${error.message}`)
+
+  revalidatePath('/dashboard/composer')
+  redirect('/dashboard/composer')
 }
 
 /**

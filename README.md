@@ -1,12 +1,12 @@
 # PostDeck
 
-A multi-tenant social media scheduling tool. **Phases 1-4 of 5 are built.** Phase 5, the
-AI assistant, is not started.
+A multi-tenant social media scheduling tool. **All five phases are built.**
 
 What works today: sign in with a password and a TOTP code, connect Facebook Pages and
-Instagram business accounts through Meta OAuth, write a post, save it as a draft or
-schedule it to several accounts at once, watch it on a calendar, move it or cancel it —
-and a worker publishes what is due. All times are UTC.
+Instagram business accounts through Meta OAuth, write a post — with a writing assistant
+if you want one — save it as a draft or schedule it to several accounts at once, watch
+it on a calendar, move it or cancel it, and a worker publishes what is due. All times
+are UTC.
 
 | Phase | What it added | State |
 |---|---|---|
@@ -14,7 +14,7 @@ and a worker publishes what is due. All times are UTC.
 | 2 | The Meta connector: OAuth, per-Page tokens, connect and disconnect | Built |
 | 3 | Scheduling and publishing: the claim, the worker, composer and calendar | Built |
 | 4 | Dashboard, drafts, editing and rescheduling | Built |
-| 5 | AI assistant | Not started |
+| 5 | The writing assistant | Built |
 
 ## Requirements
 
@@ -126,6 +126,8 @@ Once the four steps above are done:
 | Redirected to `/login` forever | The session cookie is not sticking. Check `APP_ORIGIN` matches the URL you are actually using, including the port |
 | `Invalid CSRF token` on every form | `CSRF_SIGNING_SECRET` changed between rendering the form and submitting it, or is under 32 characters |
 | Posts stay `Scheduled` after their time | Nothing is running `npm run publish:due` |
+| No **Suggest** button in the composer | `ANTHROPIC_API_KEY` is not set in `.env.local` |
+| "The assistant rejected the API key" | The key is wrong or revoked — check it at console.anthropic.com |
 | A post fails with an image error | Meta fetches the image URL itself, so `localhost` and private addresses cannot work. The composer refuses the obvious ones up front |
 | `npm run verify` fails only in `tests/db` | The database tests need a reachable Postgres; they create and drop their own scratch databases |
 
@@ -239,6 +241,38 @@ which is the only local evidence it was ever published. A column grant could not
 this, because the fact that decides it lives on a different table. A post that merely
 *failed* stays fully editable: nothing is live, so there is nothing to disagree with.
 
+## The writing assistant (Phase 5)
+
+Optional. Put an Anthropic API key in `.env.local` as `ANTHROPIC_API_KEY` and a
+**Suggest** button appears in the composer; leave it unset and nothing changes anywhere
+else in the app.
+
+It reads the draft in front of you, plus an optional one-line steer ("shorter", "mention
+the opening hours"), and proposes three alternatives. **Your draft is sent to Anthropic** —
+that is the feature, and it is the only place in this app where your content leaves for a
+third party. The image address is not sent; only the fact that an image is attached,
+because that changes what a good caption looks like.
+
+What it cannot do is the more useful half of the description. It cannot publish, cannot
+schedule, cannot read another business's posts, and has no tools. Its entire output is
+text on a page: **Use** saves a suggestion as a draft, and it still has to pass the same
+platform rules and the same human pressing *Schedule* as anything you typed yourself.
+
+Suggestions are stored rather than returned from the action, for two reasons. A server
+action's return value travels in the flight payload, which the secret scan structurally
+cannot read — so the one thing this feature produces would have gone through the one
+channel nothing checks. And a suggestion is worth keeping: it cost money, it came from
+your own draft, and `post_suggestions` records which model wrote it. That table has no
+UPDATE grant at all, deliberately: it is the record of what the model said, and a row
+you can edit in place cannot tell you whether the model wrote it or you did.
+
+The system prompt lives in `lib/assistant/prompt.ts` where it can be read and reviewed in
+a diff. Its most important line forbids inventing facts — no prices, hours or claims that
+are not already in your draft — because that is the failure that does damage after a
+human waves it through. The model is pinned to `claude-opus-5` at low effort: rewriting a
+sentence in someone's voice is not a reasoning problem, and effort is the lever that
+costs money.
+
 ## What you will see
 
 | Route | What it does |
@@ -247,7 +281,7 @@ this, because the fact that decides it lives on a different table. A post that m
 | `/mfa/enroll` | TOTP enrolment. Shown until a verified factor exists. |
 | `/mfa/verify` | TOTP challenge on later sign-ins. |
 | `/dashboard` | Overview: counts, accounts needing attention, overdue, failed, what is next, and the business switcher. |
-| `/dashboard/composer` | Write a post. Schedule it, or save it as a draft. |
+| `/dashboard/composer` | Write a post. Schedule it, save it as a draft, or ask the assistant for alternatives. |
 | `/dashboard/drafts` | Saved but not scheduled. Edit or delete. |
 | `/dashboard/calendar` | Everything scheduled, grouped by UTC day, with move and cancel. |
 | `/dashboard/accounts` | Connect and disconnect social accounts. |

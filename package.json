@@ -23,6 +23,7 @@
     "seed:admin": "tsx --env-file-if-exists=.env.local scripts/seed-admin.ts"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "0.124.0",
     "@supabase/ssr": "0.12.4",
     "@supabase/supabase-js": "2.112.3",
     "next": "16.3.1",

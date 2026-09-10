@@ -62,6 +62,24 @@ export function isMetaConfigured(): boolean {
 }
 
 /**
+ * The Anthropic API key, for the writing assistant.
+ *
+ * An app-level provider secret, so it lives in the environment alongside
+ * META_APP_SECRET rather than in Supabase Vault — the Vault holds per-ACCOUNT
+ * credentials, which are the ones that multiply and have to be revoked one at a
+ * time. Like every other server-only value it is canaried by `npm run
+ * test:secrets`, and it is read only here.
+ */
+export function anthropicApiKey(): string {
+  return required('ANTHROPIC_API_KEY', process.env.ANTHROPIC_API_KEY)
+}
+
+/** True when the assistant is configured, so the UI can say so instead of failing. */
+export function isAssistantConfigured(): boolean {
+  return Boolean(process.env.ANTHROPIC_API_KEY)
+}
+
+/**
  * The OAuth redirect target, derived from APP_ORIGIN rather than from the request.
  *
  * Deriving it from a request header would let a caller choose where the provider

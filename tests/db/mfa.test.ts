@@ -90,7 +90,8 @@ test('the MFA gate is RESTRICTIVE on every table, so no later policy can widen i
       where schemaname='public' and policyname='mfa_required' and permissive='RESTRICTIVE'
       order by tablename`)
     expect(r.rows.map((x) => x.tablename)).toEqual([
-      'audit_log', 'business_members', 'businesses', 'posts', 'scheduled_posts', 'social_accounts',
+      'audit_log', 'business_members', 'businesses', 'post_suggestions', 'posts',
+      'scheduled_posts', 'social_accounts',
     ])
   })
 })

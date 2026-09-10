@@ -1820,6 +1820,99 @@ inherit the scheduling checks, or "save this half-written thing and come back la
 the only reason drafts exist — stops working.
 
 
+## Gotchas found while building the assistant (Phase 5)
+
+### G124 — The one thing the assistant produces is the one thing nothing scans
+
+Every server action in this project returns `Promise<void>` and reports by redirecting,
+because a return value travels in the flight payload — a channel the secret scan
+structurally cannot read (G56). That rule was written about configuration values.
+
+Phase 5 is the first feature whose *entire output is generated text*. Returning
+suggestions from the action would have put the only thing this feature makes into
+the only channel nothing checks, and it would have looked completely reasonable —
+it is what every tutorial does.
+
+So suggestions go into a table and the composer reads them back. The rule paid for
+itself in a case it was not written for, which is the argument for rules stated as
+properties rather than as instances.
+
+The second-order benefit was not the reason but is worth having: a suggestion cost
+money, came from the operator's own draft, and is now something the audit trail can
+point at.
+
+### G125 — `post_suggestions` has no UPDATE grant, and that is the feature
+
+The reflex is `grant select, insert, update, delete` and move on. Here update is the
+one that must not exist: the table's only job is to record what the model said, and a
+row that can be edited in place cannot answer "did the model write this, or did I?".
+
+That question matters more than it sounds. The suggestion is *advice about what to
+publish*, and the moment it is indistinguishable from the operator's own text, the
+audit trail stops being able to attribute anything. Rewriting happens where rewriting
+belongs — in the composer, on the post.
+
+Same shape as G112 and G118: work out what the row is *for*, then grant only the
+columns and commands that serve it.
+
+### G126 — A refusal arrives as a success
+
+`stop_reason: "refusal"` comes back as an HTTP 200 with an empty or partial
+`content` array. Code that goes straight to `response.content[0].text` does not
+throw — it stores nothing, redirects cheerfully, and shows the operator a composer
+with no suggestions and no explanation.
+
+Checked explicitly before the content is read, and there is a test that returns a
+refusal and asserts it becomes an error. The same class as the Instagram defect from
+Phase 2: the failure that looks exactly like success is the one worth a test.
+
+### G127 — The image URL was going to be sent for no reason
+
+The first draft of the prompt included the image address, because the composer has
+it and it felt like context. The model cannot fetch it, so it buys nothing — and it
+is somebody's CDN path, occasionally a signed one, sent to a third party for no
+gain.
+
+What the model actually needs is *that there is an image*, because that changes what
+a good caption looks like. So the prompt says exactly that, and the test asserts the
+hostname does not appear anywhere in the outgoing request.
+
+### G128 — The provider error is a place the API key can surface
+
+Third time this project has met the same shape: `last_error` on a scheduled post
+(G116), and now an assistant failure shown in the composer. An auth failure is
+exactly the error most likely to quote back the credential it rejected.
+
+`describeAssistantError` maps the typed SDK errors to messages this app writes
+itself, and the auth case names the *variable* rather than repeating the provider's
+text. The test throws an error whose message contains the key and asserts the key
+does not survive.
+
+### G129 — Two enumerations that a new table had to be added to
+
+Adding `post_suggestions` broke exactly two tests: the migration ledger's table list
+and the RESTRICTIVE-MFA-policy list. Both failed with a clean diff naming the new
+table.
+
+Worth recording as the counter-example to this project's recurring failure. Those
+lists are hardcoded enumerations — the thing G107 and the round-15 findings kept
+catching. The difference is that these two are *closed sets asserted by equality*,
+so a new member fails the test; the ones that kept failing were *filters asserted by
+sampling*, so a new member silently fell outside the filter. Enumerate and compare
+whole, or watch behaviour. Never filter and hope.
+
+### G130 — Effort is a cost decision, and low is the right one here
+
+The house default for this model family is high effort with adaptive thinking. This
+call rewrites one or two sentences in somebody's own voice, three times.
+
+`effort: "low"`, stated in a comment with its reason, because effort is the lever
+that costs money and the alternative is paying for reasoning on a task that has
+none. `max_tokens` is 4,000 for the same reason: three posts at Instagram's 2,200
+character limit is the largest legitimate answer, and a ceiling above that only ever
+pays for something going wrong.
+
+
 ## Known, accepted limitations
 
 Stated plainly rather than left to be discovered.
@@ -1900,3 +1993,19 @@ Stated plainly rather than left to be discovered.
 21. **A published post cannot be edited or deleted through this app at all** — by design
    (G118), but it does mean a genuinely wrong record has to be fixed in the database by
    hand, with the audit trail recording that it happened.
+22. **The assistant has never been called against the live API.** Every test mocks
+   the SDK. The request shape, the refusal path and the error mapping are covered;
+   what a real reply looks like is not.
+23. **The assistant sends the operator's draft to Anthropic.** That is the feature,
+   and it is the only place in this app where content leaves for a third party.
+   It is stated on the composer and in the README rather than buried here.
+24. **There is no spend limit.** Each press of *Suggest* is one API call at
+   whatever it costs; nothing caps calls per hour or per month. For one operator
+   pressing a button this is a small bill, and it is not a control.
+25. **Suggestions accumulate until cleared.** They are per business, not per draft,
+   so the composer shows the last set until *Clear suggestions* is pressed.
+26. **The assistant cannot see the image**, only that one is attached. Captions are
+   written from the draft text, never from what is actually in the picture.
+27. **`ANTHROPIC_API_KEY` lives in the environment, not the Vault.** Consistent with
+   `META_APP_SECRET`: the Vault holds per-account credentials, which multiply and
+   are revoked one at a time. An app-level key is one value, rotated in one place.

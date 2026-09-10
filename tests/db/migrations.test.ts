@@ -49,7 +49,7 @@ test('up, down and up again all run clean, leaving nothing behind', async () => 
   await runMigrations(url, 'up')
   const afterUp = await query(url, `select table_name from information_schema.tables where table_schema='public' order by 1`)
   expect(afterUp.map((r) => r.table_name)).toEqual([
-    'audit_log', 'business_members', 'businesses', 'posts',
+    'audit_log', 'business_members', 'businesses', 'post_suggestions', 'posts',
     'scheduled_posts', 'schema_migrations', 'social_accounts',
   ])
 

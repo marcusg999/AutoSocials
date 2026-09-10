@@ -4,7 +4,11 @@ import { listBusinesses, resolveActiveBusiness, UUID_PATTERN } from '@/lib/busin
 import { MAX_POST_TEXT, parsePostContent } from '@/lib/connectors/content'
 import { defaultScheduleValue } from '@/lib/publishing/schedule-time'
 
-import { saveDraftAction, schedulePostAction } from './actions'
+import { isAssistantConfigured } from '@/lib/env'
+
+import {
+  discardSuggestionsAction, saveDraftAction, schedulePostAction, suggestPostAction,
+} from './actions'
 
 export const dynamic = 'force-dynamic'
 
@@ -44,6 +48,15 @@ export default async function ComposerPage({
   const editing = draft && draft.business_id === active?.id ? draft : null
   const content = parsePostContent(editing?.body)
 
+  // What the assistant last proposed. Row level security scopes this to the
+  // caller's businesses; the filter picks which of their own is on screen.
+  const { data: suggestionRows } = await supabase
+    .from('post_suggestions')
+    .select('id, business_id, suggestion, model, created_at')
+    .order('created_at', { ascending: true })
+
+  const suggestions = (suggestionRows ?? []).filter((row) => row.business_id === active?.id)
+
   return (
     <main>
       <h1>{editing ? 'Edit draft' : 'Composer'}</h1>
@@ -53,6 +66,7 @@ export default async function ComposerPage({
       </p>
 
       {params.saved ? <div className="panel">Draft saved.</div> : null}
+      {params.suggested ? <div className="panel">Suggestions below.</div> : null}
 
       {!active ? (
         <div className="panel"><p className="muted">Pick a business first.</p></div>
@@ -105,6 +119,18 @@ export default async function ComposerPage({
             </>
           )}
 
+          {isAssistantConfigured() ? (
+            <>
+              <label htmlFor="instruction">Ask the assistant (optional)</label>
+              <input id="instruction" name="instruction" type="text"
+                placeholder="shorter, warmer, mention the opening hours" />
+              <p className="muted">
+                It rewrites the draft above and proposes alternatives. It cannot publish
+                anything — every suggestion still has to be scheduled by you.
+              </p>
+            </>
+          ) : null}
+
           <div className="actions">
             {connected.length > 0 ? <button type="submit">Schedule</button> : null}
             {/* Same form, different action: a draft keeps whatever is typed without
@@ -112,9 +138,52 @@ export default async function ComposerPage({
             <button type="submit" formAction={saveDraftAction} className="secondary">
               {editing ? 'Save draft' : 'Save as draft'}
             </button>
+            {isAssistantConfigured() ? (
+              <button type="submit" formAction={suggestPostAction} className="secondary">
+                Suggest
+              </button>
+            ) : null}
           </div>
         </form>
       )}
+
+      {suggestions.length > 0 ? (
+        <div className="panel">
+          <h2>Suggestions</h2>
+          <ul className="rows">
+            {suggestions.map((row) => (
+              <li key={row.id}>
+                <span>
+                  {row.suggestion}
+                  <br />
+                  <span className="muted">
+                    {row.model} · {row.suggestion.length} characters
+                  </span>
+                </span>
+                {/* Using one saves it as a draft rather than scheduling it, so the
+                    assistant's text still passes through a human and a form. */}
+                {active ? (
+                  <form action={saveDraftAction} className="inline">
+                    {csrf}
+                    <input type="hidden" name="businessId" value={active.id} />
+                    {editing ? <input type="hidden" name="postId" value={editing.id} /> : null}
+                    <input type="hidden" name="text" value={row.suggestion} />
+                    <input type="hidden" name="imageUrl" value={content.imageUrl ?? ''} />
+                    <button type="submit" className="secondary">Use</button>
+                  </form>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+          {active ? (
+            <form action={discardSuggestionsAction} className="inline">
+              {csrf}
+              <input type="hidden" name="businessId" value={active.id} />
+              <button type="submit" className="secondary">Clear suggestions</button>
+            </form>
+          ) : null}
+        </div>
+      ) : null}
 
       <p className="muted">
         <a href="/dashboard/drafts">Drafts</a> · <a href="/dashboard/calendar">Calendar</a>
