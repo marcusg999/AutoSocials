@@ -122,14 +122,14 @@ Once the four steps above are done:
 
 | What you see | What it usually is |
 |---|---|
-| `ECONNREFUSED` from `npm run db:up` or `npm run test:db` | Postgres is not running, or `DATABASE_URL` / `ADMIN_DATABASE_URL` points somewhere else |
+| `ECONNREFUSED` from `npm run db:up` | Postgres is not running, or `DATABASE_URL` points somewhere else. `npm run db:ensure` will try to start one |
 | Redirected to `/login` forever | The session cookie is not sticking. Check `APP_ORIGIN` matches the URL you are actually using, including the port |
 | `Invalid CSRF token` on every form | `CSRF_SIGNING_SECRET` changed between rendering the form and submitting it, or is under 32 characters |
 | Posts stay `Scheduled` after their time | Nothing is running `npm run publish:due` |
 | No **Suggest** button in the composer | `ANTHROPIC_API_KEY` is not set in `.env.local` |
 | "The assistant rejected the API key" | The key is wrong or revoked — check it at console.anthropic.com |
 | A post fails with an image error | Meta fetches the image URL itself, so `localhost` and private addresses cannot work. The composer refuses the obvious ones up front |
-| `npm run verify` fails only in `tests/db` | The database tests need a reachable Postgres; they create and drop their own scratch databases |
+| `npm run verify` fails only in `tests/db` | The database tests need a reachable Postgres. `verify` tries to start one first; if it could not, it says what it tried |
 
 ## Connecting a Meta account (Phase 2)
 
@@ -324,6 +324,18 @@ The database tests need a Postgres server on `ADMIN_DATABASE_URL` (default
 `postgres://postdeck:postdeck@127.0.0.1:5432/postgres`). They create and drop their own
 scratch databases, and connect as a real `authenticated` role via `SET LOCAL ROLE` so that
 row level security is genuinely enforced rather than simulated.
+
+**`verify` and `test:db` start one for you.** `npm run db:ensure` runs first: if nothing is
+listening it starts a stopped local cluster (`pg_ctlcluster` on Debian/Ubuntu, `brew
+services` on macOS, or an existing `postdeck-postgres` container), waits for it, and
+carries on. It reads cluster versions and service names out of the tools that know them
+rather than guessing, and it never creates a database — a `docker run` would invent one
+whose password and volume it chose for you.
+
+It also tells the two failures apart. Nothing listening is a service to start; a server
+that answers and rejects the credentials is a role or password problem, and it says so
+instead of trying to start something that is already running. Run it on its own with
+`npm run db:ensure`.
 
 ## How the security works, in short
 

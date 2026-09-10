@@ -1913,6 +1913,42 @@ character limit is the largest legitimate answer, and a ceiling above that only 
 pays for something going wrong.
 
 
+## Gotcha from making `verify` start its own database
+
+### G131 — "The tests are broken" was "a service is not running"
+
+Every fresh container in this project came up with the Postgres cluster stopped, and
+`npm run verify` answered with six test files failing on `ECONNREFUSED`. That reads
+like the app is broken. It took a `pg_ctlcluster` command each time, remembered by
+hand, and any new machine would have hit the same wall.
+
+`npm run db:ensure` runs first in `verify` and `test:db` now. Three things it does
+that are worth writing down, because each was a way to get it wrong:
+
+**It tells "nothing is listening" from "something answered and said no."** A refused
+socket is a service to start; `28P01 password authentication failed` is a server that
+is already up. Treating them the same means the script tries to start a running
+server, fails, and reports "could not start Postgres" — replacing the precise message
+(your password is wrong) with a vague one. They arrive through completely different
+channels — an OS socket error versus a Postgres error code — so the classifier reads
+the code rather than the text where it can.
+
+**It enumerates rather than guesses.** The cluster version comes out of
+`pg_lsclusters`, the Homebrew service name out of `brew services list`. Hardcoding
+`pg_ctlcluster 16 main start` is exactly the fix that works until somebody upgrades to
+17 — the same shape as every class-test failure in this repo, in a shell command.
+
+**It never creates a database.** `docker start` on an existing container, never
+`docker run`. Creating one would invent a database whose password, port and volume
+this script chose on the operator's behalf, and the first sign of that would be a
+mystery second Postgres months later.
+
+The parsers and the classifier are unit tested; the starting is proved by having
+actually stopped the cluster and run `verify` cold. What is NOT proved is the macOS
+and Docker paths — this container has neither `brew` nor a Docker daemon, so those two
+strategies have been read and not run.
+
+
 ## Known, accepted limitations
 
 Stated plainly rather than left to be discovered.
@@ -2009,3 +2045,10 @@ Stated plainly rather than left to be discovered.
 27. **`ANTHROPIC_API_KEY` lives in the environment, not the Vault.** Consistent with
    `META_APP_SECRET`: the Vault holds per-account credentials, which multiply and
    are revoked one at a time. An app-level key is one value, rotated in one place.
+28. **Only the Debian/Ubuntu path of `db:ensure` has actually been run.** The macOS
+   (`brew services`) and Docker strategies are written and their parsers tested, but
+   this environment has neither, so they are unexercised. If the first run on a Mac
+   fails, that is where to look.
+29. **`db:ensure` cannot fix a wrong `ADMIN_DATABASE_URL`.** It deliberately does not
+   create roles, databases or containers — it starts a service that already exists,
+   or explains what it tried.
