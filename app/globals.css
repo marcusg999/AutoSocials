@@ -1,0 +1,245 @@
+:root {
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --ink: #14181d;
+  --muted: #5c6672;
+  --line: #dfe3e8;
+  --accent: #1f4fd8;
+  --danger: #b42318;
+  --radius: 8px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 16px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+
+a { color: var(--accent); }
+
+.shell {
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 32px 20px 64px;
+}
+
+.narrow { max-width: 420px; }
+
+.brand {
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin: 0 0 24px;
+}
+
+h1 { font-size: 24px; margin: 0 0 6px; }
+h2 { font-size: 17px; margin: 28px 0 10px; }
+p  { margin: 0 0 14px; }
+
+.lede { color: var(--muted); margin-bottom: 22px; }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 20px;
+  margin-bottom: 16px;
+}
+
+label {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 5px;
+}
+
+input[type="text"],
+input[type="email"],
+input[type="password"],
+input[type="url"],
+input[type="datetime-local"],
+textarea,
+select {
+  width: 100%;
+  padding: 9px 11px;
+  font-size: 15px;
+  font-family: inherit;
+  color: var(--ink);
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+input:focus, select:focus, button:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.field { margin-bottom: 16px; }
+
+/* Composer. A textarea inherits the input rules above; these are the parts an
+   input has no opinion about. */
+textarea { resize: vertical; line-height: 1.45; }
+
+fieldset {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 12px 14px;
+  margin: 16px 0;
+}
+legend { font-size: 13px; font-weight: 600; padding: 0 6px; }
+
+/* A checkbox and its text on one line, rather than the block layout `label`
+   otherwise gets. */
+label.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 400;
+  margin-bottom: 6px;
+}
+label.check input { width: auto; }
+
+.code-input {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 22px;
+  letter-spacing: 0.35em;
+}
+
+button {
+  font: inherit;
+  font-weight: 600;
+  padding: 9px 16px;
+  color: #fff;
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+button.secondary {
+  color: var(--ink);
+  background: #fff;
+  border-color: var(--line);
+}
+
+.alert {
+  padding: 10px 12px;
+  margin-bottom: 16px;
+  font-size: 14px;
+  color: var(--danger);
+  background: #fef3f2;
+  border: 1px solid #fda29b;
+  border-radius: 6px;
+}
+
+.qr {
+  width: 200px;
+  height: 200px;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px;
+}
+
+.secret {
+  display: inline-block;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 14px;
+  word-break: break-all;
+  background: #f1f3f5;
+  border-radius: 4px;
+  padding: 4px 6px;
+}
+
+.rows { list-style: none; margin: 0; padding: 0; }
+
+.rows li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.rows li:last-child { border-bottom: 0; }
+
+.muted { color: var(--muted); font-size: 14px; }
+
+.badge {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--accent);
+}
+
+.nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  align-items: center;
+  padding-bottom: 14px;
+  margin-bottom: 22px;
+  border-bottom: 1px solid var(--line);
+}
+
+.nav .spacer { flex: 1; }
+
+.switcher { display: flex; gap: 8px; align-items: flex-end; }
+.switcher .field { flex: 1; margin-bottom: 0; }
+
+/* Phase 4. Rows gained a second control, and the dashboard gained a counts strip. */
+.actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.actions .inline { display: flex; gap: 6px; align-items: center; margin: 0; }
+.actions .inline input[type="datetime-local"] { margin: 0; width: auto; }
+
+.counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 24px;
+}
+
+.counts strong { font-size: 22px; }
+
+.panel h2 {
+  font-size: 15px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin: 0 0 10px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171b;
+    --panel: #1c2025;
+    --ink: #e8eaed;
+    --muted: #99a2ad;
+    --line: #2c3239;
+    --accent: #6f9bff;
+    --danger: #ff9c94;
+  }
+  input[type="text"], input[type="email"], input[type="password"], select {
+    background: #14171b;
+    color: var(--ink);
+  }
+  button { color: #10131a; }
+  button.secondary { background: #1c2025; color: var(--ink); }
+  .alert { background: #2a1b1a; border-color: #6b2b26; }
+  .secret { background: #262b31; }
+  .qr { background: #fff; }
+}

@@ -1,0 +1,12 @@
+-- The audit log cannot be wiped by anyone, including the service role.
+--
+-- 0006 revokes TRUNCATE from anon and authenticated, and explains exactly why it
+-- matters: RLS does not filter TRUNCATE, and TRUNCATE fires no row triggers, so the
+-- append-only triggers on audit_log never see it. What that revoke missed is that
+-- Supabase also grants ALL -- TRUNCATE included -- to service_role, which is the
+-- role this app's own server uses. So the trail our own code writes was destroyable
+-- in one statement by our own code, while the test asserting "the audit log cannot
+-- be wiped" only ever tried it as a signed-in user.
+--
+-- Nothing in any phase has a reason to truncate an append-only table.
+revoke truncate on public.audit_log from service_role;

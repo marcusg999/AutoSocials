@@ -1,0 +1,263 @@
+/**
+ * CSRF: every mutation must come from one of our own origins AND carry a token
+ * this server signed, matching the httpOnly cookie.
+ *
+ * These tests drive assertCsrf() itself, not just the token helpers, because the
+ * two bugs a previous revision shipped both lived in the checking code rather than
+ * in the token: the origin was compared against a client-supplied header, and a
+ * planted cookie was accepted because it matched the field the attacker also sent.
+ */
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
+import { NextRequest, NextResponse } from 'next/server'
+
+process.env.CSRF_SIGNING_SECRET ??= 'test-signing-secret-at-least-32-characters-long'
+
+let cookieJar = new Map<string, string>()
+let headerBag = new Headers()
+
+let signedInUserId: string | null = null
+
+vi.mock('@/lib/security/session', () => ({
+  resolveSessionState: async () =>
+    signedInUserId === null
+      ? { status: 'anonymous' as const }
+      : { status: 'verified' as const, session: { supabase: {}, userId: signedInUserId, email: null } },
+}))
+
+vi.mock('next/headers', () => ({
+  cookies: async () => ({
+    get: (name: string) => (cookieJar.has(name) ? { name, value: cookieJar.get(name)! } : undefined),
+    set: (name: string, value: string) => { cookieJar.set(name, value) },
+    delete: (name: string) => { cookieJar.delete(name) },
+  }),
+  headers: async () => headerBag,
+}))
+
+const {
+  CSRF_COOKIE_NAME, CSRF_FIELD_NAME, createCsrfToken, csrfCookieOptions,
+  csrfTokensMatch, isValidCsrfToken, issueCsrfToken, attachCsrfCookie,
+} = await import('@/lib/security/csrf-token')
+const { assertCsrf, CsrfError, rotateCsrfToken, clearCsrfToken } = await import('@/lib/security/csrf')
+
+const OUR_ORIGIN = 'https://postdeck.example.com'
+
+beforeEach(() => {
+  cookieJar = new Map()
+  headerBag = new Headers()
+  signedInUserId = null
+  process.env.APP_ORIGIN = OUR_ORIGIN
+  vi.stubEnv('NODE_ENV', 'production')
+})
+afterEach(() => { vi.unstubAllEnvs() })
+
+/** Builds a submission: what the cookie holds, what the form sent, where it came from. */
+function submission({ cookie, field, origin, host }: {
+  cookie?: string; field?: string; origin?: string; host?: string
+}) {
+  if (cookie !== undefined) cookieJar.set(CSRF_COOKIE_NAME, cookie)
+  if (origin !== undefined) headerBag.set('origin', origin)
+  if (host !== undefined) headerBag.set('x-forwarded-host', host)
+  const form = new FormData()
+  if (field !== undefined) form.set(CSRF_FIELD_NAME, field)
+  return form
+}
+
+describe('a legitimate submission is accepted', () => {
+  test('correct token, our origin', async () => {
+    const token = createCsrfToken(signedInUserId)
+    await expect(assertCsrf(submission({ cookie: token, field: token, origin: OUR_ORIGIN })))
+      .resolves.toBeUndefined()
+  })
+})
+
+describe('the origin check cannot be talked around', () => {
+  test('a cross-origin post is refused', async () => {
+    const token = createCsrfToken(signedInUserId)
+    await expect(assertCsrf(submission({ cookie: token, field: token, origin: 'https://evil.example' })))
+      .rejects.toThrow(/cross-origin/i)
+  })
+
+  test('spoofing x-forwarded-host does NOT make evil.example look like us', async () => {
+    // The regression that matters. An earlier version compared Origin against
+    // x-forwarded-host, so an attacker who sent both headers passed the check.
+    const token = createCsrfToken(signedInUserId)
+    await expect(assertCsrf(submission({
+      cookie: token, field: token,
+      origin: 'https://evil.example',
+      host: 'evil.example',
+    }))).rejects.toThrow(/cross-origin/i)
+  })
+
+  test('a request with no Origin or Referer at all is refused', async () => {
+    const token = createCsrfToken(signedInUserId)
+    await expect(assertCsrf(submission({ cookie: token, field: token })))
+      .rejects.toThrow(/neither Origin nor Referer/i)
+  })
+
+})
+
+describe('the token cannot be forged or planted', () => {
+  test('a value the attacker made up is rejected even when both halves agree', async () => {
+    // The other regression that matters. The old check was "cookie === field",
+    // which an attacker satisfies trivially by supplying both.
+    await expect(assertCsrf(submission({
+      cookie: 'ATTACKER_PLANTED_VALUE',
+      field: 'ATTACKER_PLANTED_VALUE',
+      origin: OUR_ORIGIN,
+    }))).rejects.toThrow(CsrfError)
+  })
+
+  test('a token with a tampered signature is rejected', async () => {
+    const token = createCsrfToken(signedInUserId)
+    const tampered = token.slice(0, -4) + 'AAAA'
+    await expect(assertCsrf(submission({ cookie: tampered, field: tampered, origin: OUR_ORIGIN })))
+      .rejects.toThrow(CsrfError)
+  })
+
+  test('an expired token is rejected', () => {
+    const [nonce] = createCsrfToken(signedInUserId).split('.')
+    const past = `${nonce}.${Date.now() - 1000}.whatever`
+    expect(isValidCsrfToken(past, null)).toBe(false)
+  })
+
+  test('a valid cookie with a mismatched form field is rejected', async () => {
+    await expect(assertCsrf(submission({
+      cookie: createCsrfToken(signedInUserId), field: createCsrfToken(signedInUserId), origin: OUR_ORIGIN,
+    }))).rejects.toThrow(/mismatch/i)
+  })
+
+  test('a missing form field is rejected', async () => {
+    await expect(assertCsrf(submission({ cookie: createCsrfToken(signedInUserId), origin: OUR_ORIGIN })))
+      .rejects.toThrow(/no token in the submitted form/i)
+  })
+
+  test('a missing cookie is rejected', async () => {
+    await expect(assertCsrf(submission({ field: createCsrfToken(signedInUserId), origin: OUR_ORIGIN })))
+      .rejects.toThrow(/no token cookie/i)
+  })
+})
+
+describe('a token is bound to the session it was issued to', () => {
+  test('one user\'s valid token is refused when replayed as another user', async () => {
+    // The gap a signature alone leaves open: it proves the server minted the
+    // token, not that it minted it FOR YOU. Any legitimate user could otherwise
+    // read their own cookie value and replay it as somebody else.
+    signedInUserId = 'mallory-user-id'
+    const mallorysToken = createCsrfToken(signedInUserId)
+
+    signedInUserId = 'victim-user-id'
+    cookieJar.set(CSRF_COOKIE_NAME, mallorysToken)
+    headerBag.set('origin', OUR_ORIGIN)
+    const form = new FormData()
+    form.set(CSRF_FIELD_NAME, mallorysToken)
+
+    await expect(assertCsrf(form)).rejects.toThrow(CsrfError)
+  })
+
+  test('a token issued before sign-in is refused after it', async () => {
+    const anonymousToken = createCsrfToken(null)
+    signedInUserId = 'now-signed-in'
+    cookieJar.set(CSRF_COOKIE_NAME, anonymousToken)
+    headerBag.set('origin', OUR_ORIGIN)
+    const form = new FormData()
+    form.set(CSRF_FIELD_NAME, anonymousToken)
+    await expect(assertCsrf(form)).rejects.toThrow(CsrfError)
+  })
+
+  test('a signed-in user\'s own token is accepted', async () => {
+    signedInUserId = 'legitimate-user'
+    const token = createCsrfToken(signedInUserId)
+    cookieJar.set(CSRF_COOKIE_NAME, token)
+    headerBag.set('origin', OUR_ORIGIN)
+    const form = new FormData()
+    form.set(CSRF_FIELD_NAME, token)
+    await expect(assertCsrf(form)).resolves.toBeUndefined()
+  })
+})
+
+describe('the token itself', () => {
+  test('is signed, unguessable and unique', () => {
+    const a = createCsrfToken(signedInUserId)
+    const b = createCsrfToken(signedInUserId)
+    expect(a).not.toBe(b)
+    expect(a.split('.')).toHaveLength(3)
+    expect(isValidCsrfToken(a, null)).toBe(true)
+  })
+
+  test('a length mismatch is rejected rather than throwing', () => {
+    expect(() => csrfTokensMatch(createCsrfToken(null), 'short', null)).not.toThrow()
+    expect(csrfTokensMatch(createCsrfToken(null), 'short', null)).toBe(false)
+  })
+
+  test('a planted cookie is replaced, not trusted, when the proxy sees it', () => {
+    const request = new NextRequest(new URL('https://postdeck.test/login'))
+    request.cookies.set(CSRF_COOKIE_NAME, 'ATTACKER_PLANTED_VALUE')
+    const issued = issueCsrfToken(request, null)
+    expect(issued.isNew, 'an unsigned cookie must be replaced').toBe(true)
+    expect(issued.token).not.toBe('ATTACKER_PLANTED_VALUE')
+    expect(isValidCsrfToken(issued.token, null)).toBe(true)
+  })
+
+  test('a token we did sign is reused across the same session', () => {
+    const request = new NextRequest(new URL('https://postdeck.test/login'))
+    const first = issueCsrfToken(request, null)
+    expect(first.isNew).toBe(true)
+    const second = issueCsrfToken(request, null)
+    expect(second.isNew).toBe(false)
+    expect(second.token).toBe(first.token)
+  })
+})
+
+describe('the cookie', () => {
+  test('is httpOnly, same-site and path-scoped', () => {
+    const options = csrfCookieOptions()
+    expect(options.httpOnly, 'the browser must never be able to read it').toBe(true)
+    expect(options.sameSite).toBe('lax')
+    expect(options.path).toBe('/')
+    expect(options.maxAge).toBeGreaterThan(0)
+  })
+
+  test('is attached to the response so the browser stores it', () => {
+    const response = NextResponse.next()
+    const token = createCsrfToken(signedInUserId)
+    attachCsrfCookie(response, token)
+    expect(response.cookies.get(CSRF_COOKIE_NAME)?.httpOnly).toBe(true)
+  })
+
+  test('is rotated at sign-in and cleared at sign-out', async () => {
+    const before = createCsrfToken(signedInUserId)
+    cookieJar.set(CSRF_COOKIE_NAME, before)
+
+    await rotateCsrfToken(null)
+    const after = cookieJar.get(CSRF_COOKIE_NAME)!
+    expect(after, 'a token minted before sign-in must not survive it').not.toBe(before)
+    expect(isValidCsrfToken(after, null)).toBe(true)
+
+    await clearCsrfToken()
+    expect(cookieJar.has(CSRF_COOKIE_NAME)).toBe(false)
+  })
+})
+
+test('no token is ever placed anywhere the browser could read it', async () => {
+  const { readFileSync, readdirSync, statSync } = await import('node:fs')
+  const { join } = await import('node:path')
+
+  const walk = (dir: string, out: string[] = []): string[] => {
+    for (const entry of readdirSync(dir)) {
+      const full = join(dir, entry)
+      if (statSync(full).isDirectory()) walk(full, out)
+      else if (/\.(ts|tsx)$/.test(full)) out.push(full)
+    }
+    return out
+  }
+
+  const sources = [...walk('app'), ...walk('lib'), 'proxy.ts']
+  const offenders = sources.filter((file) =>
+    /localStorage|sessionStorage/.test(readFileSync(file, 'utf8')))
+  expect(offenders, 'tokens must never be stored in web storage').toEqual([])
+})
+
+// Round 15: dropped the unset-APP_ORIGIN case, which duplicates the throw
+// next.config.ts already performs at build time. Origin checking, token forgery,
+// subject binding and expiry stay -- CSRF is one of the three things here that
+// still faces a real adversary.
