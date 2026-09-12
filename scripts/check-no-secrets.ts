@@ -12,7 +12,7 @@ import { execFileSync, spawn } from 'node:child_process'
 import { createServer } from 'node:http'
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, rmSync, writeFileSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
-import { join, relative } from 'node:path'
+import { join, relative, sep } from 'node:path'
 
 const ROOT = process.cwd()
 const failures: string[] = []
@@ -90,8 +90,22 @@ function checkPublicVarNames() {
   // The whole project, not four named directories. next.config.ts, components/ and
   // any .cjs/.mts file sat outside the old scope, and a NEXT_PUBLIC_ name is
   // inlined into the browser bundle from wherever it is written.
-  const sources = walkProject().filter((f) => /\.(m|c)?[jt]sx?$/.test(f))
+  // Everything Next can compile into the browser bundle. `tests/` is excluded and
+  // only `tests/`: Next never builds it and Vitest runs it in Node, so a
+  // NEXT_PUBLIC_ name written there cannot be inlined anywhere -- while a test that
+  // asserts "an unknown NEXT_PUBLIC_ variable is a mistake" has to name one to do
+  // it. Narrowing a population is how this project's checks have gone wrong before,
+  // so the assertion below makes sure the remaining set is still real.
+  const sources = walkProject()
+    .filter((f) => /\.(m|c)?[jt]sx?$/.test(f))
+    .filter((f) => !relative(ROOT, f).startsWith('tests' + sep))
   if (existsSync(join(ROOT, '.env.example'))) sources.push(join(ROOT, '.env.example'))
+
+  // Without this, deleting app/ would make the scan pass by having nothing to scan.
+  if (!sources.some((f) => relative(ROOT, f).startsWith('app' + sep))) {
+    fail('the NEXT_PUBLIC_ scan found no files under app/, so it is not scanning the app')
+    return
+  }
 
   const offenders: string[] = []
   for (const file of sources) {
