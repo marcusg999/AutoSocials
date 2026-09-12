@@ -349,6 +349,52 @@ that answers and rejects the credentials is a role or password problem, and it s
 instead of trying to start something that is already running. Run it on its own with
 `npm run db:ensure`.
 
+## Deploying
+
+**The web app goes to Netlify.** Connect the repository at app.netlify.com; the build
+settings in `netlify.toml` are the whole configuration, and Netlify supplies its own
+Next.js adapter with no plugin to install or pin.
+
+Then set the environment variables under **Site configuration → Environment variables** —
+none of them belong in the repository:
+
+| Variable | Notes |
+|---|---|
+| `APP_ORIGIN` | The exact deployed origin, e.g. `https://postdeck.netlify.app`. **The build fails without it**, on purpose — see below. |
+| `NEXT_PUBLIC_SUPABASE_URL` | |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | |
+| `SUPABASE_SERVICE_ROLE_KEY` | |
+| `CSRF_SIGNING_SECRET` | `openssl rand -base64 48` |
+| `TRUSTED_PROXY_COUNT` | `1` behind Netlify's edge |
+| `META_APP_ID`, `META_APP_SECRET` | Optional; without them the Accounts page cannot connect anything |
+| `ANTHROPIC_API_KEY` | Optional; without it the composer has no Suggest button |
+
+`DATABASE_URL`, `ADMIN_EMAIL` and `ADMIN_PASSWORD` are **not** needed in Netlify. They
+are read by `db:up` and `seed:admin`, which you run from your own machine against the
+same Supabase project.
+
+Two consequences worth knowing before the first deploy rather than after.
+
+**The build refuses to run without `APP_ORIGIN`,** with a message saying so. That is a
+deliberate control, not a rough edge: `serverActions.allowedOrigins` is baked in at build
+time, and an empty list makes Next fall back to deriving the expected origin from the
+request's own forwarded headers — a value the client controls. Failing closed is the
+point, so the fix is always to set the variable, never to relax the check.
+
+**Deploy previews each get their own origin,** which one fixed `APP_ORIGIN` cannot match,
+so previews will fail the build. Either turn deploy previews off, or give the
+`deploy-preview` context its own `APP_ORIGIN` pointing at a stable alias. There is no
+automatic fallback to Netlify's `DEPLOY_PRIME_URL` on purpose: it would have to be
+threaded through the runtime CSRF check as well, and a half-wired fallback around an
+origin check is worse than not having one.
+
+**Nothing on Netlify publishes posts.** `npm run publish:due` is a one-shot process that
+claims what is due, publishes it and exits; it needs an external scheduler — Railway, a
+cron job, or any host that can run a command every minute or two with the same
+`SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`. Deploy the site without one and posts
+will sit past their time, which is exactly what the dashboard's **Overdue** section
+exists to make visible.
+
 ## How the security works, in short
 
 **Tenancy.** Every table is behind row level security, enabled *and* forced. A row is

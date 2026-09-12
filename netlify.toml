@@ -1,0 +1,31 @@
+# Netlify build settings for the web app.
+#
+# Deliberately short. Netlify detects Next.js and applies its adapter with no
+# configuration, and their own guidance is NOT to pin the adapter version — they
+# ship fixes for new Next releases and a pinned version silently stops receiving
+# them. So there is no [[plugins]] block here, and no publish directory: both are
+# things Netlify already knows and we would only get wrong later.
+#
+# What is worth stating is the Node version, because package.json declares
+# engines >= 20.9.0 and a build that silently runs on something older fails in a
+# way that looks like a code problem.
+#
+# The worker is not here. `npm run publish:due` is a one-shot process that an
+# external scheduler runs; nothing on Netlify runs it. See "Deploying" in the
+# README.
+
+[build]
+  command = "npm run build"
+
+[build.environment]
+  NODE_VERSION = "20"
+
+# APP_ORIGIN is deliberately NOT set here.
+#
+# It is baked into serverActions.allowedOrigins at build time, and next.config.ts
+# fails the build when it is missing rather than letting Next fall back to
+# trusting forwarded headers. A value committed to this file would be wrong for
+# somebody else's site and right for nobody, so it belongs in Netlify's own
+# environment variables where it can name the actual deployed origin.
+#
+# The same goes for every secret: Site configuration → Environment variables.
