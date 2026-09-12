@@ -35,8 +35,20 @@ npm install
 cp .env.example .env.local
 ```
 
-Fill in `.env.local`. Every variable is commented in `.env.example` with what it is and
-why it matters. Three are easy to get wrong:
+Fill in `.env.local`, then check it before anything tries to use it:
+
+```bash
+npm run env:check
+```
+
+That reads the file and names what is wrong — a missing value, a placeholder left in,
+the anon key pasted into the service-role slot, two Supabase URLs that disagree, the
+transaction pooler's port 6543 (which breaks migrations half way through). **It never
+prints a value**, only variable names and verdicts, because this is the one file that
+holds every secret at once and terminal scrollback ends up in screenshots. It makes no
+network calls either: `db:up` and `seed:admin` are what actually prove the values work.
+
+Every variable is commented in `.env.example` with what it is and why it matters. Three are easy to get wrong:
 
 - `CSRF_SIGNING_SECRET` — generate one with `openssl rand -base64 48`. At least 32 characters.
 - `APP_ORIGIN` — the exact origin the app is served from. Required in production; the

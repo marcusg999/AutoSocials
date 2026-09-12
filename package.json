@@ -21,7 +21,8 @@
     "publish:due": "tsx --env-file-if-exists=.env.local scripts/publish-due.ts",
     "verify": "npm run db:ensure && APP_ORIGIN=${APP_ORIGIN:-http://127.0.0.1:3000} npm run build && npm run typecheck && npm run test && npm run test:secrets",
     "seed:admin": "tsx --env-file-if-exists=.env.local scripts/seed-admin.ts",
-    "db:ensure": "tsx --env-file-if-exists=.env.local scripts/ensure-postgres.ts"
+    "db:ensure": "tsx --env-file-if-exists=.env.local scripts/ensure-postgres.ts",
+    "env:check": "tsx scripts/check-env.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "0.124.0",

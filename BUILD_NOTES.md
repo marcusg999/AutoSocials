@@ -1949,6 +1949,59 @@ and Docker paths — this container has neither `brew` nor a Docker daemon, so t
 strategies have been read and not run.
 
 
+## Gotchas from the environment checker
+
+### G132 — A tool that diagnoses your secrets must never print them
+
+`npm run env:check` reads the one file in the project that holds every credential at
+once, and writes to a terminal whose scrollback ends up in screenshots, bug reports and
+shared sessions. The obvious helpful touch — "SUPABASE_SERVICE_ROLE_KEY looks wrong:
+`eyJhbGci...`" — would make the tool a worse leak than the mistake it is diagnosing.
+
+Findings carry a variable name, a level and a sentence. Never a value. Lengths are
+allowed ("is 8 characters") because a length is not a secret. The property is asserted
+directly: a test builds a config where every rule fires, serialises the whole report,
+and checks that no value appears in it — with a guard that the report was non-empty, so
+it cannot pass by finding nothing.
+
+### G133 — The false positive is the worse error
+
+The first version rejected any value starting with `xxx`, because `xxx` was in the
+placeholder pattern. A real 48-character random secret that happens to start with three
+x's would have been reported as "still the placeholder", sending the operator to look
+for a problem that does not exist.
+
+Caught by the checker's own test suite on the very first run. The filler patterns now
+match the WHOLE value (`^[x.]{3,}$`) rather than its start. For a setup tool the
+asymmetry is clear: missing a placeholder costs one confusing error later, while
+rejecting a correct value costs an hour of looking in the wrong place.
+
+The same reasoning removed `[YOUR-PASSWORD]` from the generic placeholder test. It is
+Supabase's copy-button text, not `.env.example`'s, so the generic message was wrong AND
+it suppressed the specific checks underneath it — the operator saw "still the
+placeholder" and not "this is the transaction pooler port, which will break migrations".
+
+### G134 — The secret scan flagged its own test fixtures
+
+A test asserting "an unknown `NEXT_PUBLIC_` variable is a mistake" has to name one. The
+name then sat in the source tree, and `check-no-secrets` — which greps every source file
+for `NEXT_PUBLIC_[A-Z_]+` — failed on it.
+
+The tempting fixes were both wrong: adding the name to the allowlist would weaken the
+real check, and concatenating the string in the test to dodge the grep would be exactly
+the "make the check stop looking" move this project's gotchas keep catching.
+
+The right fix was to make the population precise. That check exists because the prefix
+inlines a value into the **browser bundle**; Next never compiles `tests/`, and Vitest
+runs it in Node, so a name written there cannot be inlined anywhere. `tests/` is now
+excluded — and only `tests/`, with a guard that fails if the remaining set contains no
+files under `app/`, because narrowing a population is precisely how this project's
+checks have gone wrong before.
+
+Verified in both directions rather than by reading it: green on the fixtures, and still
+failing loudly when the same name is planted in `lib/env.ts`.
+
+
 ## Known, accepted limitations
 
 Stated plainly rather than left to be discovered.
